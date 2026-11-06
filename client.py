@@ -23,10 +23,11 @@ that has passed Cloudflare Turnstile. A key copied from a *different*
 browser/machine does NOT work — the backend returns ``invalid_key``. So the
 key MUST be minted on the same machine that calls the API. ``KeyManager``
 does exactly that: on first use (and whenever the backend says
-``invalid_key``) it launches headless Chromium via Playwright, opens the
-generator page, lets Turnstile pass, and captures the key from the
-``/api/verifyUser`` call. The key is cached in memory and in ``userkey.txt``
-so restarts reuse it while it is still valid (hours-days).
+``invalid_key``) it launches a real Chromium browser (HEADED, under Xvfb —
+see HEADED MINT below), opens the generator page, lets Turnstile pass, and
+captures the key from the page's own API calls. The key is cached in memory
+and in ``userkey.txt`` so restarts reuse it while it is still valid
+(hours-days).
 
 If the browser flow fails (no Chromium installed, Turnstile blocks it, ...),
 the manager falls back to the ``PERCHANCE_USER_KEY`` env var / ``userkey.txt``
@@ -98,8 +99,26 @@ all. The listener now captures from request URLs, POST bodies, and
 key?) in the step trail, so the next live run says definitively
 whether generate fired and where the key lives.
 
+HEADED MINT (2026-11-06) — the widened capture PROVED the failure is
+Turnstile's own client failing inside a HEADLESS browser, not a missed
+key: after Generate was clicked the page fired GET /api/verifyUser
+(x62-65, resp 200), GET /api/getAccessCodeForAdPoweredStuff, POST /api/ss,
+GET /api/cv, GET /api/count and GET /api/turnstileClientFail (x3) — every
+one scanned in URL, POST body and response body, NONE contained a key,
+and /api/generate NEVER fired at all. The Turnstile client reports its
+own failure (turnstileClientFail) in headless mode even though the
+cf_clearance cookie is present. So the mint now runs HEADED Chromium
+(headless=False) under a virtual display (Xvfb) by default — a real
+visible browser is the one thing Turnstile's client has not yet been
+given. The mint starts Xvfb itself when no DISPLAY is set and stops it
+in finally; if Xvfb is missing it logs a clear error and falls back to
+headless. ``PERCHANCE_HEADLESS=1`` forces the old headless path.
+
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
-shell) needs roughly 250-400 MB while it runs. The browser is only launched
+shell) needs roughly 250-400 MB headless and more headed (a real window +
+compositor) while it runs — Colab's ~12 GB has room; on a 512 MB host the
+headed mint would not fit, so PERCHANCE_HEADLESS=1 keeps the old headless
+path there. The browser is only launched
 on demand (LAZY — never at startup; the 2026-11-06 startup warm-up mint
 killed the Render instance into a restart loop, so it was removed), in a
 worker thread with a HARD 90s timeout that kills the browser on expiry,
@@ -145,6 +164,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import threading
 import time
 from urllib.parse import urlparse
@@ -235,6 +256,68 @@ _KEY_ANY_RE = re.compile(r'userKey[^0-9a-fA-F]{1,12}([0-9a-fA-F]{64})')
 # in tests to point at a localhost mock (the mock's /api/* calls must
 # be logged the same way the real ones are).
 _API_HOST = "perchance.org"
+
+# HEADED mint (2026-11-06): Turnstile's client fails inside a headless
+# browser (turnstileClientFail x3 on live Colab, /api/generate never
+# fired, cf_clearance present anyway), so the mint runs HEADED Chromium
+# under a virtual display by default. PERCHANCE_HEADLESS=1 forces the
+# old headless path (e.g. hosts with no Xvfb / 512 MB RAM).
+_XVFB_DISPLAYS = (99, 98, 97, 96)
+_XVFB_SCREEN = "1366x768x24"
+
+
+def _headless_requested():
+    """True when the operator forces the old headless mint via env var."""
+    return os.environ.get("PERCHANCE_HEADLESS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _start_xvfb():
+    """Start a private Xvfb for the headed mint, if no display exists.
+
+    Returns (proc, error): proc is the Popen object (None when no Xvfb
+    was started — either a display already exists, or it could not be
+    started), error is a human-readable reason or None. Sets DISPLAY in
+    this process when it starts one; the caller must restore it via
+    _stop_xvfb(). Never raises."""
+    if os.environ.get("DISPLAY"):
+        return None, None
+    if shutil.which("Xvfb") is None:
+        return None, "Xvfb is not installed on this host"
+    for disp in _XVFB_DISPLAYS:
+        display = f":{disp}"
+        try:
+            proc = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", _XVFB_SCREEN],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        time.sleep(0.7)
+        if proc.poll() is None:
+            os.environ["DISPLAY"] = display
+            return proc, None
+        # Exited immediately (display already in use?) — try the next.
+    return None, "Xvfb failed to start on displays :99-:96"
+
+
+def _stop_xvfb(proc, had_display):
+    """Stop a private Xvfb started by _start_xvfb and restore DISPLAY
+    to what it was before the mint (unset if it was unset). No-op when
+    proc is None. Never raises."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    if had_display is None:
+        os.environ.pop("DISPLAY", None)
+    else:
+        os.environ["DISPLAY"] = had_display
 
 
 def _load_browser_engine():
@@ -399,7 +482,7 @@ class KeyManager:
             return self._mint_with_timeout(timeout)
 
     def refresh_locked(self, timeout=_MINT_TIMEOUT):
-        """Mint a key via headless Chromium. Caller must hold the lock.
+        """Mint a key via the (headed) browser. Caller must hold the lock.
         Kept for compatibility — delegates to the threaded mint."""
         return self._mint_with_timeout(timeout)
 
@@ -948,6 +1031,19 @@ class KeyManager:
 
         start = time.time()
         deadline = start + timeout
+        # HEADED by default (Turnstile's client fails inside a headless
+        # browser — see module docstring); PERCHANCE_HEADLESS=1 forces
+        # the old headless path.
+        headless = _headless_requested()
+        xvfb_proc = None
+        xvfb_had_display = os.environ.get("DISPLAY")
+        if not headless:
+            xvfb_proc, xvfb_error = _start_xvfb()
+            if xvfb_error:
+                self._step(f"xvfb: {xvfb_error} — falling back to headless")
+                logger.warning("Perchance mint: %s — headless fallback",
+                               xvfb_error)
+                headless = True
         try:
             with sync_playwright() as p:
                 # CRITICAL: channel="chromium" forces the FULL Chrome
@@ -957,9 +1053,27 @@ class KeyManager:
                 # (Verified: plain launch looked for
                 # chromium_headless_shell-1248; channel="chromium" selects
                 # the full Chrome-for-Testing binary in new headless mode.)
-                self._step(f"engine: {engine_name} (full chromium)")
-                browser = p.chromium.launch(headless=True, args=launch_args,
-                                            channel="chromium")
+                # Headed mode (headless=False) runs on the Xvfb display
+                # started above (or the host's own DISPLAY).
+                self._step(f"engine: {engine_name} (full chromium, "
+                           f"{'headless' if headless else 'headed'})")
+                try:
+                    browser = p.chromium.launch(
+                        headless=headless, args=launch_args,
+                        channel="chromium")
+                except Exception as e:
+                    if headless:
+                        raise
+                    # Headed launch failed (Xvfb died? no display?) —
+                    # fall back to headless once rather than failing
+                    # the whole mint.
+                    self._step(f"headed launch failed "
+                               f"({type(e).__name__}: {e}) — "
+                               "falling back to headless")
+                    headless = True
+                    browser = p.chromium.launch(
+                        headless=True, args=launch_args,
+                        channel="chromium")
                 # Watchdog handle: _mint_with_timeout can kill this
                 # browser from another thread if the hard timeout fires.
                 self._active_browser = browser
@@ -1144,6 +1258,11 @@ class KeyManager:
             logger.warning("Perchance key mint failed: %s",
                            self._last_error, exc_info=True)
             return None
+        finally:
+            # Stop our private Xvfb (no-op if none was started) and
+            # restore DISPLAY — otherwise the next mint would reuse a
+            # dead display.
+            _stop_xvfb(xvfb_proc, xvfb_had_display)
         if not found:
             self._step("key: NOT captured (all phases exhausted)")
             logger.warning("Perchance key mint: browser ran but no userKey "
