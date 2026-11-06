@@ -2,8 +2,11 @@
 """Perchance image-generation client + automatic userKey management.
 
 Reverse-engineered from the Perchance generator page
-(https://perchance.org/ai-text-to-image-generator). There is NO official
-public API — this replays the browser's own calls to the internal backend
+(https://perchance.org/b7kc35yv7u — the reference client's page; the
+ai-text-to-image-generator page was abandoned 2026-11-06 after
+Turnstile refused keys there in every browser mode). There is NO
+official public API — this replays the browser's own calls to the
+internal backend
 ``https://image-generation.perchance.org/api``:
 
   POST /api/generate   (query: userKey, requestId, adAccessCode, __cacheBust)
@@ -149,14 +152,41 @@ two things, both documented in the reverse-engineered b7kc35yv7u client
 ``generate(uncensored=True)`` applies exactly that: subChannel="nsfw"
 plus the documented prompt handling, nothing invented.
 
-CAVEAT (unverified pairing): the reference client sends subChannel="nsfw"
-paired with channel="b7kc35yv7u" (a different Perchance generator page).
-This client keeps channel="ai-text-to-image-generator" and only flips
-subChannel. If live uncensored generation is refused (invalid_data) or
-comes back filtered, the first thing to try is channel="b7kc35yv7u" for
-uncensored requests — that page also shows an "I am over 18 - Show
-Content" gate to new browser sessions, which the mint flow would then
-need to click.
+PAIRING (now live): subChannel="nsfw" is sent with channel="b7kc35yv7u"
+— the exact pairing the reference client uses for its in-browser
+generate (see B7KC35YV7U PAGE below). The mint runs on the same page,
+so the key is minted on the channel the generate call uses.
+
+B7KC35YV7U PAGE (2026-11-06) — the ai-text-to-image-generator page is
+done: the headed mint proved Turnstile's own client fails there
+(turnstileClientFail x3, /api/generate never fired, verifyUser x106
+all 200 with no key) on a cloud IP, headless or headed, stealth or
+not. The mint now runs on the reference client's page instead:
+https://perchance.org/b7kc35yv7u ("Fast Free AI Animation / Image
+Generator"), the only documented working browser flow
+(adrianx26/webgenimg perchance_client.py, read live). That client's
+flow, followed here: load the page, click the "I am over 18 - Show
+Content" gate (#showContentBtn) if a new session shows one (the
+generator iframe is only created after the gate is clicked — the
+mint waits 3s after a gate click for it), click the Generate button
+in the generator iframe, capture userKey from the /api/generate
+request URL. It does NOT fill a prompt before clicking Generate —
+this mint still tries the iframe prompt fill first (harmless: if the
+box is there it guarantees a non-empty prompt; if not, the mint
+proceeds to the click exactly like the reference flow). Its
+in-browser generate uses channel="b7kc35yv7u", so this client's
+direct generate calls now use the same channel.
+
+Honest odds: the reference client was written for a DESKTOP machine
+(local Chrome, residential IP) — there is no evidence it works on a
+datacentre IP, and Turnstile scores the IP as well as the browser.
+The b7kc35yv7u page may simply have a different (simpler) Turnstile
+setup, or it may share the same one and fail the same way. This is
+the last untried page and the only documented working flow, so it is
+worth the attempt — but if the live Colab trail shows
+turnstileClientFail again on this page, Turnstile refuses keys to
+ANY automated browser on a cloud IP regardless of page, and the
+automated mint is definitively dead for $0.
 """
 
 import json
@@ -175,7 +205,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 BASE = "https://image-generation.perchance.org/api"
-GENERATOR_PAGE = "https://perchance.org/ai-text-to-image-generator"
+GENERATOR_PAGE = "https://perchance.org/b7kc35yv7u"
 
 # HARD mint budget (seconds). The mint used to run up to 150s+ with no
 # overall cap, and Render's 512 MB free instance died mid-mint (restart
@@ -1161,7 +1191,14 @@ class KeyManager:
                         pass
                     self._step("page: settled (networkidle or timeout)")
                     self._step(self._click_turnstile_widget(page))
-                    self._step(self._click_content_gate(page))
+                    gate_status = self._click_content_gate(page)
+                    self._step(gate_status)
+                    if "clicked" in gate_status:
+                        # The gate hides the generator iframe until
+                        # clicked (reference client waits 5s after the
+                        # gate for the iframe to be created) — give it
+                        # a moment before the fill/button scans run.
+                        page.wait_for_timeout(3000)
                     _humanize(page)
                     clearance = self._check_cf_clearance(ctx)
                     self._step("cookies: cf_clearance "
@@ -1448,11 +1485,13 @@ class PerchanceClient:
             "seed": seed,
             "resolution": resolution,
             "guidanceScale": guidance_scale,
-            "channel": "ai-text-to-image-generator",
-            # The uncensored switch: "nsfw" instead of "public".
-            # Documented in webgenimg's client; see module docstring for
-            # the channel-pairing caveat (reference pairs it with
-            # channel="b7kc35yv7u").
+            # Channel of the page the key was minted on (the reference
+            # client's page — see module docstring, B7KC35YV7U PAGE).
+            "channel": "b7kc35yv7u",
+            # The uncensored switch: "nsfw" instead of "public", paired
+            # with channel="b7kc35yv7u" — the exact pairing the
+            # reference client (webgenimg) uses for its in-browser
+            # generate.
             "subChannel": "nsfw" if uncensored else "public",
             "userKey": key,
             "adAccessCode": "",
