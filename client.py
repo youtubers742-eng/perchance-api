@@ -259,9 +259,36 @@ the embed in an iframe on a wrapper page — it "only talks to a
 PARENT window" — which this mint does NOT do (top-level load kept).
 If the UI still does not render with the hash config, the
 wrapper/iframe hosting is the next thing to try.
+
+IFRAME-WRAPPER MINT (2026-11-06 ~20:48 IST) — the hash config ALSO
+failed (14th attempt, live Colab): the embed URL with the full
+11-field hash config loads, the page settles, cf_clearance is
+present, verifyUser returns HTTP 200 — but the embed UI STILL never
+renders: no prompt box, no Generate button, zero /api/* calls,
+localStorage empty. The embed "only talks to a PARENT window": loaded
+top-level, its JS never initializes the UI at all. So the mint now
+loads a minimal wrapper page with page.set_content() (top level is
+about:blank) containing one <iframe id="genFrame"> whose src is the
+embed URL with the hash config (reused _embed_url builder), sized
+100%x100% so the embed renders normally. set_content was chosen over
+a local HTTP server: no extra thread/port/cleanup to leak when the
+hard-timeout watchdog kills the browser, and the embed only needs *a*
+parent window, not a real-URL one. Playwright's page-level
+request/response listeners still capture the iframe's traffic,
+frame.evaluate still reads the iframe's localStorage (cross-origin
+via CDP), and the prompt fill / Generate click already scan
+page.frames for perchance.org frames. The mint waits after the
+wrapper load for the UI to appear inside the iframe and logs whether
+it rendered. Phase C's in-page verifyUser fetch runs inside the
+embed frame (not the about:blank top level) so its CORS behaviour is
+unchanged. Honest odds: this is the last untried mechanism from the
+reference's design — if the UI still does not render inside the
+iframe, the automated mint has exhausted the reference's whole
+playbook.
 """
 
 from contextlib import contextmanager
+import html
 import json
 import logging
 import os
@@ -328,6 +355,49 @@ def _embed_url(prompt, resolution="512x512", seed=-1, guidance=7,
     }
     blob = json.dumps(hash_data, separators=(",", ":"))
     return EMBED_PAGE + "#" + quote(blob)
+
+
+def _embed_frame(page):
+    """The frame hosting the embed, or None.
+
+    Primary match: a frame whose URL is the embed origin. Fallback:
+    the wrapper page's only direct child frame with a real URL (the
+    wrapper hosts exactly one iframe, the genFrame) — this is what
+    lets the mock test use a localhost embed URL, and it is also the
+    correct answer on the real page (the embed's own subframes —
+    Turnstile, ads — are nested inside the embed frame, not direct
+    children of the wrapper). An about:blank child does not count:
+    the iframe frame exists before its navigation lands. Used by the
+    wrapper mint (UI-rendered wait) and by Phase C's in-page
+    verifyUser fetch, which must run inside the embed origin.
+    Never raises."""
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return None
+    for frame in frames:
+        try:
+            url = frame.url or ""
+        except Exception:
+            continue
+        if "image-generation.perchance.org/embed" in url:
+            return frame
+    try:
+        main = page.main_frame
+        for frame in frames:
+            try:
+                if frame is main:
+                    continue
+                if frame.parent_frame is not main:
+                    continue
+                url = frame.url or ""
+                if url and url != "about:blank":
+                    return frame
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 # HARD mint budget (seconds). The mint used to run up to 150s+ with no
 # overall cap, and Render's 512 MB free instance died mid-mint (restart
@@ -721,7 +791,8 @@ class KeyManager:
                               if s.split(" ", 1)[1].startswith(
                                   ("widget:", "gate:", "generate:",
                                    "verifyUser:", "cookies:", "prompt:",
-                                   "api:", "key:", "storage:")))
+                                   "api:", "key:", "storage:", "wrapper:",
+                                   "embed UI")))
             detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
@@ -1024,6 +1095,92 @@ class KeyManager:
         return None, (f"storage: no userKey in {frames_checked} "
                       f"frame(s){suffix}")
 
+    def _load_embed_wrapper(self, page, mint_url, deadline):
+        """Host the embed in a full-viewport iframe on a minimal
+        wrapper page (see IFRAME-WRAPPER MINT in the module docstring)
+        and wait for its UI to render inside the iframe.
+
+        The embed loaded top-level — plain URL or with the full hash
+        config — never initializes its UI (proven live 2026-11-06,
+        14 attempts: page loads, title correct, cf_clearance present,
+        verifyUser 200, but no prompt box, no Generate button, zero
+        /api/* calls). The embed only talks to a PARENT window, so the
+        mint loads a wrapper via page.set_content() (top level is
+        about:blank) with one <iframe id="genFrame"> whose src is the
+        embed URL with the hash config. set_content (not a local HTTP
+        server): no extra thread/port to leak when the hard-timeout
+        watchdog kills the browser, and the embed only needs *a*
+        parent window. The iframe id "genFrame" matches the iframeId
+        in the hash config built by _embed_url.
+
+        Returns the embed frame, or None if the iframe never appeared.
+        Logs "wrapper: iframe loaded" plus "embed UI: rendered in
+        iframe" / "embed UI: still not rendered" — the step the next
+        live run needs, because the whole hypothesis stands or falls
+        on whether the UI renders inside the iframe. Never raises:
+        a missing UI is a mint outcome, not a crash (the existing
+        phases still run and may capture a key from storage/network).
+        """
+        escaped = html.escape(mint_url, quote=True)
+        wrapper = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>gen</title></head><body style='margin:0'>"
+            f"<iframe id='genFrame' src='{escaped}' "
+            "style='position:fixed;top:0;left:0;width:100%;height:100%;"
+            "border:0'></iframe></body></html>")
+        try:
+            page.set_content(wrapper, timeout=15000)
+        except Exception as e:
+            self._step(f"wrapper: set_content failed "
+                       f"({type(e).__name__}: {e})")
+            return None
+        # Wait for the embed iframe to appear in page.frames.
+        embed = None
+        frame_deadline = min(deadline, time.time() + 15)
+        while time.time() < frame_deadline \
+                and not self._mint_stop.is_set():
+            embed = _embed_frame(page)
+            if embed is not None:
+                break
+            page.wait_for_timeout(500)
+        if embed is None:
+            self._step("wrapper: no embed iframe appeared (15s)")
+            return None
+        try:
+            url = embed.url or "?"
+        except Exception:
+            url = "?"
+        self._step(f"wrapper: iframe loaded (frame {url[:70]})")
+        # Wait for the generator UI to render inside the iframe: the
+        # prompt textarea or any button at all. A bare iframe document
+        # has neither; the live embed's UI has both. locator.count()
+        # does not auto-wait, so poll it — a not-yet-loaded frame
+        # just reads as 0, and a detached frame throws (caught).
+        ui_deadline = min(deadline, time.time() + 15)
+        rendered = False
+        while time.time() < ui_deadline and not self._mint_stop.is_set():
+            try:
+                if embed.locator(
+                        'textarea.paragraph-input[data-name="description"]'
+                        ).count() > 0:
+                    rendered = True
+                    break
+            except Exception:
+                pass
+            try:
+                if embed.locator("button").count() > 0:
+                    rendered = True
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(500)
+        if rendered:
+            self._step("embed UI: rendered in iframe")
+        else:
+            self._step("embed UI: still not rendered (no prompt box / "
+                       "Generate button in iframe after 15s)")
+        return embed
+
     def _launch_camoufox(self, headless):
         """Launch Camoufox (Firefox anti-detect); return (manager, browser).
 
@@ -1140,10 +1297,14 @@ class KeyManager:
         browser flow is the only documented one that works, plus the
         embed-page design of pophvllo-art/perchance-mcp):
 
-        A. Load the embed page WITH its URL-hash JSON config (see
-           _embed_url — the plain URL renders no UI at all); let
-           Turnstile's managed challenge run. If a Turnstile widget
-           iframe is visible,
+        A. Host the embed in an iframe on a minimal wrapper page
+           loaded with page.set_content() (see IFRAME-WRAPPER MINT:
+           the embed only initializes its UI when it has a parent
+           window; top-level loads never render it), the iframe src
+           being the embed URL WITH its URL-hash JSON config (see
+           _embed_url). Wait for the UI to render inside the iframe
+           and log whether it did. Let Turnstile's managed challenge
+           run. If a Turnstile widget iframe is visible,
            click it like a human; click the "I am over 18" content
            gate if the page shows one (the embed page likely has
            none). Check the cf_clearance cookie, then scan
@@ -1293,7 +1454,14 @@ class KeyManager:
             on every attempt). A __cacheBust param is added to match the
             real client's verifyUser call."""
             try:
-                data = page.evaluate(
+                # Run the fetch inside the embed frame, not the
+                # wrapper's about:blank top level: the fetch is
+                # same-origin from the embed origin (no CORS), exactly
+                # as it was when the mint loaded the embed top-level.
+                # Falls back to the top-level page if the iframe is
+                # gone (a previous method navigated it away).
+                frame = _embed_frame(page) or page
+                data = frame.evaluate(
                     """async () => {
                         try {
                             const r = await fetch(
@@ -1463,25 +1631,26 @@ class KeyManager:
                     page.on("response", _on_response)
 
                     # -- Phase A: load the page, face the challenge -----
-                    # The embed MUST be loaded with its URL-hash JSON
-                    # config (see _embed_url): the plain URL renders an
-                    # empty shell with no generator UI at all (proven
-                    # live 2026-11-06 ~20:15 IST). The hash prompt is
+                    # The embed MUST be hosted in an iframe on a
+                    # wrapper page (see IFRAME-WRAPPER MINT): loaded
+                    # top-level — plain URL or with the full hash
+                    # config — its UI never initializes (proven live
+                    # 2026-11-06, 14 attempts). The wrapper's iframe
+                    # src is the embed URL WITH its URL-hash JSON
+                    # config (see _embed_url); the hash prompt is
                     # "a red rose" so the generator initializes with
-                    # something real to generate; the Phase B fill below
-                    # is only a fallback for a rendered prompt box.
+                    # something real to generate. The Phase B fill
+                    # below is only a fallback for a rendered prompt
+                    # box.
                     mint_url = _embed_url("a red rose")
-                    self._step(f"page: goto {mint_url}")
-                    try:
-                        page.goto(mint_url,
-                                  wait_until="domcontentloaded",
-                                  timeout=30000)
-                        self._step("page: loaded "
-                                   f"(title={page.title()[:60]!r})")
-                    except Exception as e:
-                        self._step(f"page: goto failed "
-                                   f"({type(e).__name__}: {e})")
-                        raise
+                    embed_frame = self._load_embed_wrapper(
+                        page, mint_url, deadline)
+                    if embed_frame is None:
+                        # No iframe at all means no embed origin to
+                        # mint from — fail fast with a clear trail,
+                        # the way the old page.goto failure did.
+                        self._step("page: wrapper load failed")
+                        raise RuntimeError("embed wrapper did not load")
                     _humanize(page)
                     try:
                         # The Perchance SPA may never reach networkidle
