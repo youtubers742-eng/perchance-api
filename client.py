@@ -78,6 +78,15 @@ hardened too: the in-page fetch threw every time (a cross-origin fetch
 from perchance.org to image-generation.perchance.org hits CORS), so it
 now escalates fetch -> context API request (same cookies, no CORS) ->
 navigate to the verifyUser URL (the reference client's approach).
+The fill itself was then fixed the same day (2026-11-06, 17:17 IST):
+live inspection of the real generator page showed the prompt box is a
+<textarea class="paragraph-input" data-name="description"> INSIDE the
+generator <iframe> — the outer page is a shell, so a top-level search
+finds nothing (that is why the first fill timed out). The placeholder
+rotates every 3.5s and is never matched on; there is no negative-prompt
+box on the page. _fill_prompt now scans perchance.org frames for
+``textarea.paragraph-input[data-name="description"]`` then
+``textarea[data-name="description"]``.
 
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
@@ -594,10 +603,22 @@ class KeyManager:
         for the step trail. Never raises: a missing prompt box must
         not kill the mint (the Generate click is still attempted).
 
-        Scans perchance.org frames (the generator iframe is one of
-        them) for a textarea, preferring one whose placeholder
-        mentions prompt/describe/image, skipping the negative-prompt
-        box; falls back to a plain text input."""
+        FACTS (live inspection of the real generator page, 2026-11-06):
+        the prompt box is a <textarea> INSIDE the generator <iframe>
+        (the outer page is a shell — a search against the top-level
+        document finds NOTHING, which is why the old fill timed out).
+        Exact attributes: class="paragraph-input",
+        data-name="description"; NO id, NO name. The placeholder
+        ROTATES to a new random example every 3.5s, so it is NEVER
+        used for matching. There is NO negative-prompt box on this
+        page (commented out in settings), so none is looked for.
+
+        Scans perchance.org frames (mirroring
+        _click_generate_button: ad iframes are skipped) for
+        ``textarea.paragraph-input[data-name="description"]`` then
+        ``textarea[data-name="description"]``; fills, verifies the
+        value stuck, and falls back to press_sequentially typing if
+        the SPA ignores fill()."""
         last_fail = None
         try:
             for frame in page.frames:
@@ -611,75 +632,44 @@ class KeyManager:
                     continue
                 if "perchance.org" not in url:
                     continue
-                # --- textareas first --------------------------------
-                try:
-                    areas = frame.locator("textarea")
-                    n_areas = areas.count()
-                except Exception:
-                    n_areas = 0
-                best = None
-                for i in range(n_areas):
+                label = url[:70] or "?"
+                for selector in (
+                        'textarea.paragraph-input[data-name="description"]',
+                        'textarea[data-name="description"]'):
                     if self._mint_stop.is_set():
                         return "prompt: aborted (mint stopped)"
                     if time.time() > deadline:
                         return "prompt: scan timed out"
                     try:
-                        ta = areas.nth(i)
-                        ph = (ta.get_attribute("placeholder") or "").lower()
+                        loc = frame.locator(selector)
+                        if loc.count() == 0:
+                            continue
+                        ta = loc.first
                     except Exception:
                         continue
-                    if "negative" in ph:
-                        continue
-                    if best is None:
-                        best = ta
-                    if any(w in ph for w in ("prompt", "describe",
-                                             "image")):
-                        best = ta
-                        break
-                if best is not None:
                     try:
-                        best.click(timeout=5000)
-                        best.fill(prompt_text, timeout=5000)
-                        val = best.input_value(timeout=2000) or ""
+                        ta.click(timeout=5000)
+                        ta.fill(prompt_text, timeout=5000)
+                        val = ta.input_value(timeout=2000) or ""
                         if prompt_text not in val:
                             # Some SPAs ignore fill() — type it instead.
-                            best.press_sequentially(prompt_text, delay=30)
-                            val = best.input_value(timeout=2000) or ""
+                            ta.press_sequentially(prompt_text, delay=30)
+                            val = ta.input_value(timeout=2000) or ""
                         if prompt_text in val:
                             return (f"prompt: filled {prompt_text!r} "
-                                    "(textarea)")
+                                    f"(textarea, frame {label})")
                         last_fail = ("prompt: fill did not stick "
-                                     "(textarea)")
+                                     f"(textarea, frame {label})")
                     except Exception as e:
                         last_fail = (f"prompt: fill failed "
-                                     f"({type(e).__name__})")
-                    continue
-                # --- plain text inputs as fallback ------------------
-                try:
-                    inputs = frame.locator(
-                        "input[type='text'], input:not([type])")
-                    n_inputs = inputs.count()
-                except Exception:
-                    n_inputs = 0
-                for i in range(n_inputs):
-                    if self._mint_stop.is_set():
-                        return "prompt: aborted (mint stopped)"
-                    if time.time() > deadline:
-                        return "prompt: scan timed out"
-                    try:
-                        inp = inputs.nth(i)
-                        ph = (inp.get_attribute("placeholder") or "").lower()
-                        if "negative" in ph:
-                            continue
-                        inp.click(timeout=5000)
-                        inp.fill(prompt_text, timeout=5000)
-                        return (f"prompt: filled {prompt_text!r} (input)")
-                    except Exception:
-                        continue
+                                     f"({type(e).__name__}, frame {label})")
+                    # A box was found in this frame (selector 2 is a
+                    # superset of selector 1, so it would match the
+                    # same box); move on to the next frame.
+                    break
             if last_fail:
                 return last_fail
-            return ("prompt: no prompt box found "
-                    "(Generate click will use empty prompt)")
+            return "prompt: no prompt box found in any frame"
         except Exception as e:
             return f"prompt: check failed ({type(e).__name__})"
 
