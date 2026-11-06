@@ -248,6 +248,17 @@ TLS fingerprints), and Vesper's Camoufox success was local-only.
 Install: pip install camoufox && python -m camoufox fetch
 (~1.3 GB browser download) + Firefox system libs
 (python -m playwright install-deps firefox) + Xvfb.
+
+EMBED-HASH-CONFIG FIX (2026-11-06 ~20:15 IST) — the Camoufox trail
+proved the plain embed URL renders an EMPTY shell (no UI at all),
+so the mint now loads the embed WITH its URL-hash JSON config
+(see _embed_url, copied from pophvllo-art/perchance-mcp
+app/browser.py _embed_url, "the way the official page does it").
+Known remaining difference, flagged not hidden: the reference hosts
+the embed in an iframe on a wrapper page — it "only talks to a
+PARENT window" — which this mint does NOT do (top-level load kept).
+If the UI still does not render with the hash config, the
+wrapper/iframe hosting is the next thing to try.
 """
 
 from contextlib import contextmanager
@@ -260,7 +271,8 @@ import shutil
 import subprocess
 import threading
 import time
-from urllib.parse import urlparse
+import uuid
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -270,14 +282,52 @@ BASE = "https://image-generation.perchance.org/api"
 # Mint page: the Perchance EMBED page. Verified against
 # pophvllo-art/perchance-mcp app/browser.py (read live 2026-11-06):
 # the embed is loaded at https://image-generation.perchance.org/embed
-# (optionally with a URL-hash JSON config, e.g. #{"prompt":"warmup"}).
+# WITH a URL-hash JSON config — the embed parses
+# window.location.hash as JSON and only initializes its generator UI
+# from that config. The plain URL renders an EMPTY shell: proven live
+# 2026-11-06 ~20:15 IST (Camoufox mint: page loaded, cf_clearance
+# present, verifyUser HTTP 200 — but no prompt box, no Generate
+# button, zero /api/* calls, localStorage empty). The reference's
+# warmup load is #{"prompt":"warmup"} (browser.py _load_embed) and
+# its per-generation URL is built by _embed_url() (browser.py L521-555,
+# "the way the official page does it"). The mint below uses the same
+# builder, so the goto URL is identical in format to the reference's.
 # All previous mint pages were generator pages
 # (ai-text-to-image-generator, then b7kc35yv7u — both failed with
-# turnstileClientFail on cloud IPs); the embed page was never tried.
-# It is Perchance's native generation context, and the key lives in
-# ITS origin's localStorage (userKey-0), so the mint reads storage
-# instead of only watching network traffic.
+# turnstileClientFail on cloud IPs). The embed is Perchance's native
+# generation context, and the key lives in ITS origin's localStorage
+# (userKey-0), so the mint reads storage instead of only watching
+# network traffic.
 EMBED_PAGE = "https://image-generation.perchance.org/embed"
+
+
+def _embed_url(prompt, resolution="512x512", seed=-1, guidance=7,
+               negative=""):
+    """Build the embed URL the way the official page does.
+
+    Mirrors pophvllo-art/perchance-mcp app/browser.py _embed_url()
+    (L521-555) field-for-field, including field order, compact JSON
+    separators, urllib.parse.quote, a fresh requestId per call, and
+    iframeId "genFrame". saveChannel is "" — the reference's default
+    (config.py SAVE_CHANNEL defaults to ""). Resolution "512x512"
+    matches the reference's warmup navigation; the mint only needs
+    the key, not a large image.
+    """
+    hash_data = {
+        "prompt": prompt,
+        "seed": seed,
+        "resolution": resolution,
+        "guidanceScale": guidance,
+        "negativePrompt": negative or "",
+        "saveChannel": "",
+        "saveTitle": prompt,
+        "saveDescription": negative or "",
+        "requestId": str(uuid.uuid4()),
+        "iframeId": "genFrame",
+        "hideGalleryButtons": True,
+    }
+    blob = json.dumps(hash_data, separators=(",", ":"))
+    return EMBED_PAGE + "#" + quote(blob)
 
 # HARD mint budget (seconds). The mint used to run up to 150s+ with no
 # overall cap, and Render's 512 MB free instance died mid-mint (restart
@@ -1090,8 +1140,10 @@ class KeyManager:
         browser flow is the only documented one that works, plus the
         embed-page design of pophvllo-art/perchance-mcp):
 
-        A. Load the embed page; let Turnstile's managed
-           challenge run. If a Turnstile widget iframe is visible,
+        A. Load the embed page WITH its URL-hash JSON config (see
+           _embed_url — the plain URL renders no UI at all); let
+           Turnstile's managed challenge run. If a Turnstile widget
+           iframe is visible,
            click it like a human; click the "I am over 18" content
            gate if the page shows one (the embed page likely has
            none). Check the cf_clearance cookie, then scan
@@ -1411,8 +1463,17 @@ class KeyManager:
                     page.on("response", _on_response)
 
                     # -- Phase A: load the page, face the challenge -----
+                    # The embed MUST be loaded with its URL-hash JSON
+                    # config (see _embed_url): the plain URL renders an
+                    # empty shell with no generator UI at all (proven
+                    # live 2026-11-06 ~20:15 IST). The hash prompt is
+                    # "a red rose" so the generator initializes with
+                    # something real to generate; the Phase B fill below
+                    # is only a fallback for a rendered prompt box.
+                    mint_url = _embed_url("a red rose")
+                    self._step(f"page: goto {mint_url}")
                     try:
-                        page.goto(EMBED_PAGE,
+                        page.goto(mint_url,
                                   wait_until="domcontentloaded",
                                   timeout=30000)
                         self._step("page: loaded "
