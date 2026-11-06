@@ -27,8 +27,9 @@ that has passed Cloudflare Turnstile. A key copied from a *different*
 browser/machine does NOT work — the backend returns ``invalid_key``. So the
 key MUST be minted on the same machine that calls the API. ``KeyManager``
 does exactly that: on first use (and whenever the backend says
-``invalid_key``) it launches a real Chromium browser (HEADED, under Xvfb —
-see HEADED MINT below), opens the embed page, lets Turnstile pass, and
+``invalid_key``) it launches a real browser (Camoufox Firefox since
+2026-11-06; HEADED, under Xvfb — see HEADED MINT below), opens the
+embed page, lets Turnstile pass, and
 captures the key from the embed origin's localStorage (and from the
 page's own API calls, as before). The key is cached in memory
 and in ``userkey.txt`` so restarts reuse it while it is still valid
@@ -44,8 +45,10 @@ STEALTH — why Patchright, and its honest limit
 Plain Playwright Chromium is trivially detectable (``--enable-automation``,
 ``navigator.webdriver``, ``Runtime.enable``/``Console.enable`` CDP leaks)
 and Cloudflare Turnstile blocks it on datacentre IPs — that is exactly
-what happened on Render. So the mint uses **Patchright**, a patched
-Playwright drop-in: it removes the automation flags, executes JS in
+what happened on Render. So the mint used **Patchright**, a patched
+Playwright drop-in (2026-11-06: superseded by Camoufox as the mint
+engine — see CAMOUFOX MINT; Patchright stays only as a fallback when
+Camoufox is not installed): it removes the automation flags, executes JS in
 isolated contexts (no ``Runtime.enable`` leak), disables the Console API
 leak, and passes Cloudflare's fingerprint checks. On top of that the mint
 moves the mouse like a human, scrolls, and waits with random delays
@@ -112,7 +115,7 @@ GET /api/cv, GET /api/count and GET /api/turnstileClientFail (x3) — every
 one scanned in URL, POST body and response body, NONE contained a key,
 and /api/generate NEVER fired at all. The Turnstile client reports its
 own failure (turnstileClientFail) in headless mode even though the
-cf_clearance cookie is present. So the mint now runs HEADED Chromium
+cf_clearance cookie is present. So the mint now runs HEADED
 (headless=False) under a virtual display (Xvfb) by default — a real
 visible browser is the one thing Turnstile's client has not yet been
 given. The mint starts Xvfb itself when no DISPLAY is set and stops it
@@ -130,8 +133,12 @@ worker thread with a HARD 90s timeout that kills the browser on expiry,
 with the renderer capped to one process and a 256 MB V8 heap cap. The
 steady-state server stays small and /health always answers instantly.
 Patchright uses the same Chromium binary family, so its RAM is in the
-same range; Camoufox (Firefox-based, heavier, plus a separate browser
-download) was deliberately NOT used for this reason.
+same range. Camoufox's Firefox is heavier (headed Firefox + its own
+~1.3 GB browser download via ``camoufox fetch``) — fine on Colab's
+~12 GB, not on a 512 MB host; PERCHANCE_HEADLESS=1 keeps the old
+headless path there. (The Chromium renderer/V8 caps above apply to
+the Patchright/Playwright fallback paths only — Firefox ignores
+Chromium flags.)
 
 UNCENSORED MODE — how Perchance actually selects it
 ---------------------------------------------------
@@ -218,8 +225,32 @@ turnstileClientFail recurs on the embed page too, the automated
 mint is definitively dead for $0 (proven across 3 hosts, 3 pages,
 headless + headed, Chromium, stealth + plain, browserless +
 browser, and every capture method).
+
+CAMOUFOX MINT (2026-11-06) — the embed page ALSO failed (12th
+attempt, 2026-11-06 19:30 IST: page loaded, cf_clearance present,
+but no widget, no prompt box, no Generate button, localStorage
+empty — Turnstile never passes on the embed page either). The one
+engine family never tried on cloud is Firefox: Camoufox is a
+patched Firefox build that spoofs the device fingerprint in C++
+(navigator, screen, WebGL, fonts, audio, WebRTC — all internally
+consistent, drawn from real traffic) and drives it through
+Playwright via Juggler (no automation code visible to the page).
+The mint now launches Camoufox headful under Xvfb (os="linux" so
+the identity matches the Linux host and the canvas renders
+natively; humanize=True; locale en-US) and keeps every capture
+method (localStorage scan, widened network capture, prompt fill +
+Generate click, three-way verifyUser). Patchright / plain Playwright
+remain only as import fallbacks when Camoufox is not installed.
+Honest odds ~10-15%: the IP is still Colab's Google IP and
+Turnstile scores it heavily — Decodo's testing says Cloudflare
+managed challenges also block Camoufox (it does not modify JA3/JA4
+TLS fingerprints), and Vesper's Camoufox success was local-only.
+Install: pip install camoufox && python -m camoufox fetch
+(~1.3 GB browser download) + Firefox system libs
+(python -m playwright install-deps firefox) + Xvfb.
 """
 
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -410,23 +441,31 @@ def _stop_xvfb(proc, had_display):
 
 
 def _load_browser_engine():
-    """Return (sync_playwright, engine_name, launch_args).
+    """Return (kind, sync_playwright, engine_name, launch_args).
 
-    Patchright first (stealth-patched Chromium — the only engine with a
-    real chance against Turnstile on a datacentre IP). Falls back to
-    plain Playwright if Patchright is not installed, so local dev
-    without patchright still works.
+    Camoufox first (Firefox anti-detect — the mint engine since
+    2026-11-06; see CAMOUFOX MINT in the module docstring). For kind
+    "camoufox" sync_playwright is None (Camoufox manages its own
+    Playwright instance) and launch_args is [] (Camoufox takes its
+    own options, not Chromium flags). Falls back to Patchright, then
+    plain Playwright, so local dev without camoufox still works.
+    kind is "camoufox" | "patchright" | "playwright" | "none".
     """
     try:
+        from camoufox.sync_api import Camoufox  # noqa: F401
+        return "camoufox", None, "camoufox", []
+    except ImportError:
+        pass
+    try:
         from patchright.sync_api import sync_playwright
-        return sync_playwright, "patchright", PATCHRIGHT_ARGS
+        return "patchright", sync_playwright, "patchright", PATCHRIGHT_ARGS
     except ImportError:
         pass
     try:
         from playwright.sync_api import sync_playwright
-        return sync_playwright, "playwright", PLAYWRIGHT_ARGS
+        return "playwright", sync_playwright, "playwright", PLAYWRIGHT_ARGS
     except ImportError:
-        return None, "none", []
+        return "none", None, "none", []
 
 
 def _humanize(page):
@@ -935,6 +974,114 @@ class KeyManager:
         return None, (f"storage: no userKey in {frames_checked} "
                       f"frame(s){suffix}")
 
+    def _launch_camoufox(self, headless):
+        """Launch Camoufox (Firefox anti-detect); return (manager, browser).
+
+        Headed (headless=False) under the Xvfb display the caller
+        started, unless PERCHANCE_HEADLESS=1. os="linux" pins the
+        drawn identity to the Linux host, so the canvas renders
+        natively (no noise, no LeakWarning); humanize=True makes the
+        cursor move like a human (matches the reference client,
+        CerberusLD); locale="en-US" matches the mint's US timezone.
+        On a headed-launch failure, falls back to headless once
+        (mirrors the Chromium path). Raises if both fail — the
+        caller's except records it. The manager must be exited by
+        the caller (see _mint_browser)."""
+        from camoufox.sync_api import Camoufox  # deferred import
+
+        self._step(f"engine: camoufox (Firefox, "
+                   f"{'headless' if headless else 'headed'})")
+        try:
+            mgr = Camoufox(headless=headless, os="linux",
+                           humanize=True, locale="en-US")
+            return mgr, mgr.__enter__()
+        except Exception as e:
+            if headless:
+                raise
+            self._step(f"camoufox headed launch failed "
+                       f"({type(e).__name__}: {e}) — "
+                       "falling back to headless")
+            mgr = Camoufox(headless=True, os="linux",
+                           humanize=True, locale="en-US")
+            return mgr, mgr.__enter__()
+
+    @contextmanager
+    def _mint_browser(self, kind, sync_playwright, engine_name,
+                      launch_args, headless):
+        """Open the mint browser for either engine; yield
+        (browser, ctx, page); close everything on exit.
+
+        kind "camoufox": Camoufox (Firefox) via its own context
+        manager. The page gets the mint viewport + en-US locale +
+        US timezone; the user agent is deliberately NOT overridden
+        — Camoufox draws an internally consistent Firefox identity,
+        and a Chrome UA on a Firefox engine is exactly the mismatch
+        it exists to avoid. (Explicit viewport= always wins over
+        Camoufox's no_viewport default — verified in the installed
+        camoufox/utils.py.)
+        kind "patchright"/"playwright": the old Chromium path (full
+        Chrome binary via channel="chromium")."""
+        if kind == "camoufox":
+            mgr, browser = self._launch_camoufox(headless)
+            try:
+                page = browser.new_page(
+                    viewport=VIEWPORT,
+                    locale="en-US",
+                    # Colab's region is US; keep the context's
+                    # timezone consistent with the en-US locale.
+                    timezone_id="America/Los_Angeles",
+                )
+                yield browser, page.context, page
+            finally:
+                try:
+                    mgr.__exit__(None, None, None)
+                except Exception:
+                    pass
+            return
+        with sync_playwright() as p:
+            # CRITICAL: channel="chromium" forces the FULL Chrome
+            # binary. Without it, Playwright/Patchright 1.49+ default
+            # to the lightweight chromium-headless-shell in headless
+            # mode — and Turnstile blocks the shell build outright.
+            # (Verified: plain launch looked for
+            # chromium_headless_shell-1248; channel="chromium" selects
+            # the full Chrome-for-Testing binary in new headless mode.)
+            # Headed mode (headless=False) runs on the Xvfb display
+            # started above (or the host's own DISPLAY).
+            self._step(f"engine: {engine_name} (full chromium, "
+                       f"{'headless' if headless else 'headed'})")
+            try:
+                browser = p.chromium.launch(
+                    headless=headless, args=launch_args,
+                    channel="chromium")
+            except Exception as e:
+                if headless:
+                    raise
+                # Headed launch failed (Xvfb died? no display?) —
+                # fall back to headless once rather than failing
+                # the whole mint.
+                self._step(f"headed launch failed "
+                           f"({type(e).__name__}: {e}) — "
+                           "falling back to headless")
+                browser = p.chromium.launch(
+                    headless=True, args=launch_args,
+                    channel="chromium")
+            try:
+                ctx = browser.new_context(
+                    user_agent=UA,
+                    viewport=VIEWPORT,
+                    locale="en-US",
+                    # Render's default region is Oregon, US West.
+                    timezone_id="America/Los_Angeles",
+                )
+                page = ctx.new_page()
+                yield browser, ctx, page
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
     def _mint_via_browser(self, timeout=_MINT_TIMEOUT):
         """Open the embed page in a stealth browser and capture the
         userKey. Returns the key or None.
@@ -984,10 +1131,12 @@ class KeyManager:
         self._mint_stop so an abort lands fast. The browser is closed
         in ``finally``.
         """
-        sync_playwright, engine_name, launch_args = _load_browser_engine()
-        if sync_playwright is None:
+        kind, sync_playwright, engine_name, launch_args = \
+            _load_browser_engine()
+        if kind == "none":
             self._last_error = ("No stealth browser installed on this host "
-                                "(patchright missing; playwright also missing)")
+                                "(camoufox missing; patchright and "
+                                "playwright also missing)")
             self._step(f"engine: none — {self._last_error}")
             logger.warning("Perchance key mint: %s", self._last_error)
             return None
@@ -1200,47 +1349,13 @@ class KeyManager:
                                xvfb_error)
                 headless = True
         try:
-            with sync_playwright() as p:
-                # CRITICAL: channel="chromium" forces the FULL Chrome
-                # binary. Without it, Playwright/Patchright 1.49+ default
-                # to the lightweight chromium-headless-shell in headless
-                # mode — and Turnstile blocks the shell build outright.
-                # (Verified: plain launch looked for
-                # chromium_headless_shell-1248; channel="chromium" selects
-                # the full Chrome-for-Testing binary in new headless mode.)
-                # Headed mode (headless=False) runs on the Xvfb display
-                # started above (or the host's own DISPLAY).
-                self._step(f"engine: {engine_name} (full chromium, "
-                           f"{'headless' if headless else 'headed'})")
-                try:
-                    browser = p.chromium.launch(
-                        headless=headless, args=launch_args,
-                        channel="chromium")
-                except Exception as e:
-                    if headless:
-                        raise
-                    # Headed launch failed (Xvfb died? no display?) —
-                    # fall back to headless once rather than failing
-                    # the whole mint.
-                    self._step(f"headed launch failed "
-                               f"({type(e).__name__}: {e}) — "
-                               "falling back to headless")
-                    headless = True
-                    browser = p.chromium.launch(
-                        headless=True, args=launch_args,
-                        channel="chromium")
+            with self._mint_browser(kind, sync_playwright, engine_name,
+                                    launch_args,
+                                    headless) as (browser, ctx, page):
                 # Watchdog handle: _mint_with_timeout can kill this
                 # browser from another thread if the hard timeout fires.
                 self._active_browser = browser
                 try:
-                    ctx = browser.new_context(
-                        user_agent=UA,
-                        viewport=VIEWPORT,
-                        locale="en-US",
-                        # Render's default region is Oregon, US West.
-                        timezone_id="America/Los_Angeles",
-                    )
-                    page = ctx.new_page()
 
                     def _on_request(req):
                         # Capture from ANY request carrying a userKey:
@@ -1449,7 +1564,6 @@ class KeyManager:
                     ctx.close()
                 finally:
                     self._active_browser = None
-                    browser.close()
             # Final /api/* summary (deduped against the Phase B one).
             _log_api_summary()
         except Exception as e:  # noqa: BLE001 - log the real reason; the
@@ -1615,7 +1729,8 @@ class PerchanceClient:
                     "No Perchance userKey available: automatic browser "
                     "refresh failed and no PERCHANCE_USER_KEY is set. "
                     "Set PERCHANCE_USER_KEY to a key copied from a desktop "
-                    "browser session on THIS machine, or install Chromium "
+                    "browser session on THIS machine, or install Camoufox "
+                    "(pip install camoufox && python -m camoufox fetch) "
                     "so the server can mint one itself.")
             try:
                 return self._generate_once(prompt, negative_prompt, seed,

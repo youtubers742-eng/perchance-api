@@ -1,8 +1,13 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 httpx>=0.27
-# Patchright — stealth-patched Playwright drop-in (same API). Used ONLY for
-# the automatic userKey mint: plain Playwright Chromium is fingerprinted
-# and blocked by Cloudflare Turnstile on datacentre IPs. Install the
-# browser with: patchright install chromium --with-deps
-patchright>=1.64
+# Camoufox — Firefox-based anti-detect browser (C++-level fingerprint
+# spoofing). Used ONLY for the automatic userKey mint: plain Playwright
+# Chromium is fingerprinted and blocked by Cloudflare Turnstile on
+# datacentre IPs. Install the browser with: python -m camoufox fetch
+# (~1.3 GB download) + Firefox system libs:
+# python -m playwright install-deps firefox
+# (needs Xvfb for the headed mint — see the Colab install cell.)
+# NOTE: do NOT install patchright alongside camoufox — patchright>=1.64
+# needs playwright>=1.64 while camoufox needs playwright<1.63.
+camoufox>=0.5
