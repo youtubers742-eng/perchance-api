@@ -41,6 +41,7 @@ case set PERCHANCE_USER_KEY by hand instead.
 """
 
 import json
+import logging
 import os
 import random
 import re
@@ -48,6 +49,8 @@ import threading
 import time
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 BASE = "https://image-generation.perchance.org/api"
 GENERATOR_PAGE = "https://perchance.org/ai-text-to-image-generator"
@@ -70,6 +73,11 @@ CHROMIUM_ARGS = [
     "--mute-audio",
     "--no-first-run",
     "--disable-features=site-per-process",
+    # 512 MB hosts (Render free): one process + no zygote keeps Chromium's
+    # RSS down so the mint survives instead of OOM-killed mid-Turnstile.
+    "--single-process",
+    "--no-zygote",
+    "--disable-software-rasterizer",
 ]
 
 _KEY_RE = re.compile(r'"userKey"\s*:\s*"([0-9a-fA-F]{64})"')
@@ -92,6 +100,10 @@ class KeyManager:
         self._key_file = key_file
         self._key = None
         self._source = "none"  # env | file | browser | none
+        # Last mint attempt, for diagnosis via /health (previously the
+        # browser failure was swallowed silently and nothing logged why).
+        self._last_error = None
+        self._last_attempt = None
         # 1) explicit env var wins
         env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
         if env_key:
@@ -115,6 +127,17 @@ class KeyManager:
     @property
     def source(self):
         return self._source
+
+    @property
+    def last_error(self):
+        """Human-readable reason the last browser mint failed (None if the
+        last attempt succeeded or none ran yet)."""
+        return self._last_error
+
+    @property
+    def last_attempt(self):
+        """Epoch seconds of the last browser mint attempt (None if none)."""
+        return self._last_attempt
 
     def set_key(self, key):
         """Store a key in memory and persist it for the next restart."""
@@ -141,21 +164,37 @@ class KeyManager:
         with self._lock:
             if not force and self._key:
                 return self._key
-            return self._refresh_locked()
+            # FIX: this used to call self._refresh_locked(), which does not
+            # exist — every invalid_key retry died with AttributeError
+            # instead of minting a fresh key.
+            return self.refresh_locked()
 
     def refresh_locked(self):
         """Mint a key via headless Chromium. Caller must hold the lock."""
         # Never mint from an env/file key we already invalidated: clear it.
-        key = self._mint_via_browser()
+        self._last_attempt = time.time()
+        try:
+            key = self._mint_via_browser()
+        except Exception as e:  # noqa: BLE001 - record, don't crash the call
+            self._last_error = f"mint crashed: {type(e).__name__}: {e}"
+            logger.warning("Perchance key mint crashed: %s", self._last_error)
+            key = None
         if key:
+            self._last_error = None
             self._key = key
             self._source = "browser"
+            logger.info("Perchance key minted via browser (source=browser)")
             try:
                 with open(self._key_file, "w") as f:
                     f.write(key)
             except OSError:
                 pass
             return key
+        if not self._last_error:
+            self._last_error = ("browser mint returned no key "
+                                "(Turnstile blocked or page never yielded "
+                                "verifyUser)")
+        logger.warning("Perchance key mint failed: %s", self._last_error)
         # Browser path failed — fall back to env var if one appeared.
         env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
         if env_key:
@@ -177,6 +216,8 @@ class KeyManager:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
+            self._last_error = "Playwright not installed on this host"
+            logger.warning("Perchance key mint: %s", self._last_error)
             return None  # Playwright not installed — env key is the only way.
 
         found = []
@@ -198,7 +239,7 @@ class KeyManager:
                 try:
                     ctx = browser.new_context(
                         user_agent=UA,
-                        viewport={"width": 1280, "height": 800},
+                        viewport={"width": 800, "height": 600},
                     )
                     page = ctx.new_page()
                     # Capture the key from any verifyUser request/response.
@@ -231,8 +272,18 @@ class KeyManager:
                     ctx.close()
                 finally:
                     browser.close()
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - log the real reason; the
+            # old code swallowed this silently, so Render logs showed nothing
+            # and /health only said key_cached:false.
+            self._last_error = (f"browser mint failed: "
+                                f"{type(e).__name__}: {e}")
+            logger.warning("Perchance key mint failed: %s",
+                           self._last_error, exc_info=True)
             return None
+        if not found:
+            logger.warning("Perchance key mint: browser ran but no userKey "
+                           "was captured from verifyUser (Turnstile may "
+                           "have blocked this datacentre IP)")
         return found[-1] if found else None
 
 

@@ -18,6 +18,7 @@ Run:  uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
 """
 
 import base64
+import logging
 import os
 import threading
 import time
@@ -28,6 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from client import InvalidKeyError, KeyManager, PerchanceClient, PerchanceError
 from styles import STYLES, apply_style, list_styles
+
+logger = logging.getLogger(__name__)
 
 MODEL_ID = "perchance-image"
 MAX_IMAGES_PER_REQUEST = 4          # OpenAI 'n' is clamped to 1..4
@@ -177,6 +180,11 @@ def health():
         "styles": len(STYLES),
         "key_cached": bool(km.key),
         "key_source": km.source,  # env | file | browser | none
+        # Why the last browser mint failed (None = never tried / last ok).
+        # Lets anyone diagnose a dead key from /health alone — no need to
+        # dig through Render logs, which previously showed nothing.
+        "last_key_error": km.last_error,
+        "last_key_attempt": km.last_attempt,
         "max_resolution": "768x768",
     }
 
@@ -252,8 +260,10 @@ def _warm_key():
     def _warm():
         try:
             _client.keys.get_key()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - log it; silent pass hid
+            # the mint failure until the first real generation failed.
+            logger.warning("Perchance startup key warm-up failed: %s", e,
+                           exc_info=True)
     threading.Thread(target=_warm, daemon=True).start()
 
 
