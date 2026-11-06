@@ -68,6 +68,17 @@ exactly where it died (widget? gate? generate click? verifyUser HTTP
 status?). If this still fails on Render, the remaining honest
 explanation is the datacentre IP itself — stealth cannot change it.
 
+COLAB FINDING (2026-11-06) — on Colab the mint got FURTHER (cf_clearance
+present: Turnstile PASSED on Google's IP) but still captured no key:
+Generate was clicked, yet no /api/generate request ever fired in 30s.
+Prime suspect: the mint clicked Generate with the prompt box EMPTY, and
+the page validates the prompt before firing anything. Phase B now fills
+a dummy prompt ("a red rose") before clicking Generate. Phase C was
+hardened too: the in-page fetch threw every time (a cross-origin fetch
+from perchance.org to image-generation.perchance.org hits CORS), so it
+now escalates fetch -> context API request (same cookies, no CORS) ->
+navigate to the verifyUser URL (the reference client's approach).
+
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
 on demand (LAZY — never at startup; the 2026-11-06 startup warm-up mint
@@ -418,7 +429,7 @@ class KeyManager:
             trail = "; ".join(s.split(" ", 1)[1] for s in self._mint_steps
                               if s.split(" ", 1)[1].startswith(
                                   ("widget:", "gate:", "generate:",
-                                   "verifyUser:", "cookies:")))
+                                   "verifyUser:", "cookies:", "prompt:")))
             detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
@@ -573,6 +584,105 @@ class KeyManager:
         except Exception as e:
             return f"generate: scan failed ({type(e).__name__})"
 
+    def _fill_prompt(self, page, deadline, prompt_text="a red rose"):
+        """Type a dummy prompt into the generator's prompt box BEFORE
+        clicking Generate. The page validates the prompt before firing
+        /api/generate — with an empty prompt the Generate click does
+        nothing and no userKey ever appears (the live Colab mint:
+        Turnstile passed (cf_clearance present), Generate clicked,
+        30s of silence, no request). Returns a short status string
+        for the step trail. Never raises: a missing prompt box must
+        not kill the mint (the Generate click is still attempted).
+
+        Scans perchance.org frames (the generator iframe is one of
+        them) for a textarea, preferring one whose placeholder
+        mentions prompt/describe/image, skipping the negative-prompt
+        box; falls back to a plain text input."""
+        last_fail = None
+        try:
+            for frame in page.frames:
+                if self._mint_stop.is_set():
+                    return "prompt: aborted (mint stopped)"
+                if time.time() > deadline:
+                    return "prompt: scan timed out"
+                try:
+                    url = frame.url or ""
+                except Exception:
+                    continue
+                if "perchance.org" not in url:
+                    continue
+                # --- textareas first --------------------------------
+                try:
+                    areas = frame.locator("textarea")
+                    n_areas = areas.count()
+                except Exception:
+                    n_areas = 0
+                best = None
+                for i in range(n_areas):
+                    if self._mint_stop.is_set():
+                        return "prompt: aborted (mint stopped)"
+                    if time.time() > deadline:
+                        return "prompt: scan timed out"
+                    try:
+                        ta = areas.nth(i)
+                        ph = (ta.get_attribute("placeholder") or "").lower()
+                    except Exception:
+                        continue
+                    if "negative" in ph:
+                        continue
+                    if best is None:
+                        best = ta
+                    if any(w in ph for w in ("prompt", "describe",
+                                             "image")):
+                        best = ta
+                        break
+                if best is not None:
+                    try:
+                        best.click(timeout=5000)
+                        best.fill(prompt_text, timeout=5000)
+                        val = best.input_value(timeout=2000) or ""
+                        if prompt_text not in val:
+                            # Some SPAs ignore fill() — type it instead.
+                            best.press_sequentially(prompt_text, delay=30)
+                            val = best.input_value(timeout=2000) or ""
+                        if prompt_text in val:
+                            return (f"prompt: filled {prompt_text!r} "
+                                    "(textarea)")
+                        last_fail = ("prompt: fill did not stick "
+                                     "(textarea)")
+                    except Exception as e:
+                        last_fail = (f"prompt: fill failed "
+                                     f"({type(e).__name__})")
+                    continue
+                # --- plain text inputs as fallback ------------------
+                try:
+                    inputs = frame.locator(
+                        "input[type='text'], input:not([type])")
+                    n_inputs = inputs.count()
+                except Exception:
+                    n_inputs = 0
+                for i in range(n_inputs):
+                    if self._mint_stop.is_set():
+                        return "prompt: aborted (mint stopped)"
+                    if time.time() > deadline:
+                        return "prompt: scan timed out"
+                    try:
+                        inp = inputs.nth(i)
+                        ph = (inp.get_attribute("placeholder") or "").lower()
+                        if "negative" in ph:
+                            continue
+                        inp.click(timeout=5000)
+                        inp.fill(prompt_text, timeout=5000)
+                        return (f"prompt: filled {prompt_text!r} (input)")
+                    except Exception:
+                        continue
+            if last_fail:
+                return last_fail
+            return ("prompt: no prompt box found "
+                    "(Generate click will use empty prompt)")
+        except Exception as e:
+            return f"prompt: check failed ({type(e).__name__})"
+
     @staticmethod
     def _check_cf_clearance(context):
         """True if Turnstile set the cf_clearance cookie — the tell that
@@ -594,17 +704,24 @@ class KeyManager:
            challenge run. If a Turnstile widget iframe is visible,
            click it like a human; click the "I am over 18" content
            gate if the page shows one. Check the cf_clearance cookie.
-        B. CLICK THE GENERATE BUTTON in the generator iframe. This is
-           the step the old mint was missing: the page only calls
-           /api/verifyUser and /api/generate (whose request URL
-           carries userKey=...) after a real Generate click. Without
-           it the page never yields a key at all, however long you
-           wait. The key is captured from ANY request URL carrying
+        B. FILL A DUMMY PROMPT ("a red rose") in the generator's prompt
+           box, THEN click the Generate button in the generator iframe.
+           This is the step the old mint was missing twice over: the
+           page only calls /api/verifyUser and /api/generate (whose
+           request URL carries userKey=...) after a real Generate click
+           — and it validates the prompt first, so a Generate click
+           with an EMPTY prompt fires nothing at all (the live Colab
+           mint: Turnstile passed, Generate clicked, 30s of silence).
+           The key is captured from ANY request URL carrying
            userKey=... (generate URLs included), and the widget is
            re-checked during the wait — the challenge can also appear
            only after Generate is clicked.
-        C. If still no key, call verifyUser directly in the page
-           context (x3, long waits) — the old path, kept as fallback.
+        C. If still no key, verifyUser three different ways: in-page
+           fetch (exact error recorded), context API request (same
+           cookies, no CORS), navigate to the verifyUser URL (the
+           reference client's approach — a navigation is never
+           CORS-blocked, and the response listener captures the key
+           from the JSON body).
 
         Every step is recorded in self._mint_steps so /health shows
         exactly where a failed mint died. Overall budget ``timeout``
@@ -640,19 +757,66 @@ class KeyManager:
         def _try_verify_fetch(page):
             """Ask for a key directly inside the page context — Turnstile
             cookies are already set by now. Returns True if a key landed.
-            Records the HTTP status / body kind in verify_statuses so a
-            Cloudflare block page (403 HTML) is distinguishable from a
-            JSON reply without a key."""
+            The JS wraps the fetch in try/catch and returns the exact
+            error string, so a CORS/network failure is recorded (the old
+            code only said 'fetch-threw' and the live Colab mint threw
+            on every attempt). A __cacheBust param is added to match the
+            real client's verifyUser call."""
             try:
                 data = page.evaluate(
                     """async () => {
-                        const r = await fetch(
-                          'https://image-generation.perchance.org/api/verifyUser?thread=0',
-                          {credentials: 'include'});
-                        return r.status + ' ' + await r.text();
-                    }""")
-                m = re.match(r"(\d{3})\s?(.*)$", data or "", re.S)
-                status, body = (m.group(1), m.group(2)) if m else ("?", "")
+                        try {
+                            const r = await fetch(
+                              'https://image-generation.perchance.org/api/verifyUser'
+                              + '?thread=0&__cacheBust=' + Math.random(),
+                              {credentials: 'include'});
+                            return 'OK ' + r.status + ' ' + await r.text();
+                        } catch (e) {
+                            return 'ERR ' + (e && e.message ? e.message : String(e));
+                        }
+                    }""") or ""
+            except Exception as e:
+                verify_statuses.append(
+                    f"fetch-threw ({type(e).__name__}: {str(e)[:80]})")
+                return False
+            if data.startswith("ERR "):
+                verify_statuses.append(f"fetch-error: {data[4:120]}")
+                return False
+            m = re.match(r"OK (\d{3})\s?(.*)$", data, re.S)
+            status, body = (m.group(1), m.group(2)) if m else ("?", "")
+            if "Attention Required" in body or \
+                    "challenges.cloudflare.com" in body:
+                kind = "cf-challenge-page"
+            elif body.lstrip().startswith("{"):
+                kind = "json"
+            elif not body.strip():
+                kind = "empty"
+            else:
+                kind = "html/other"
+            verify_statuses.append(f"{status} {kind}")
+            before = len(found)
+            _capture(data)
+            return len(found) > before
+
+        def _try_verify_api_request(ctx):
+            """Same verifyUser call via the browser context's API
+            request: it shares the context's cookies (cf_clearance
+            included) but is NOT subject to the page's CORS rules, so
+            a cross-origin fetch failure cannot block it. Returns
+            True if a key landed."""
+            try:
+                resp = ctx.request.get(
+                    "https://image-generation.perchance.org/api/verifyUser"
+                    "?thread=0&__cacheBust=" + str(random.random()),
+                    headers={"User-Agent": UA,
+                             "Referer": "https://perchance.org/",
+                             "Origin": "https://perchance.org"},
+                    timeout=15000)
+                status = str(resp.status)
+                try:
+                    body = resp.text()
+                except Exception:
+                    body = ""
                 if "Attention Required" in body or \
                         "challenges.cloudflare.com" in body:
                     kind = "cf-challenge-page"
@@ -662,12 +826,33 @@ class KeyManager:
                     kind = "empty"
                 else:
                     kind = "html/other"
-                verify_statuses.append(f"{status} {kind}")
+                verify_statuses.append(f"api-req {status} {kind}")
                 before = len(found)
-                _capture(data)
+                _capture(body)
                 return len(found) > before
-            except Exception:
-                verify_statuses.append("fetch-threw")
+            except Exception as e:
+                verify_statuses.append(
+                    f"api-req threw ({type(e).__name__}: {str(e)[:80]})")
+                return False
+
+        def _try_verify_navigate(page):
+            """Navigate the page to the verifyUser URL itself (the
+            reference client's approach): a navigation is never
+            CORS-blocked, and the response listener captures the key
+            from the JSON body. Returns True if a key landed."""
+            try:
+                page.goto(
+                    "https://image-generation.perchance.org/api/verifyUser"
+                    "?thread=0&__cacheBust=" + str(random.random()),
+                    wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(1500)
+                if found:
+                    return True
+                verify_statuses.append("navigate: no key in response")
+                return False
+            except Exception as e:
+                verify_statuses.append(
+                    f"navigate threw ({type(e).__name__}: {str(e)[:80]})")
                 return False
 
         start = time.time()
@@ -744,7 +929,15 @@ class KeyManager:
                     self._step("cookies: cf_clearance "
                                f"{'present' if clearance else 'absent'}")
 
-                    # -- Phase B: click Generate, wait for the key ------
+                    # -- Phase B: fill a dummy prompt, click Generate,
+                    #    wait for the key --------------------------------
+                    # The page validates the prompt before firing
+                    # /api/generate: with an empty prompt the Generate
+                    # click fires nothing and no userKey ever appears
+                    # (live Colab mint: Turnstile passed, Generate
+                    # clicked, 30s of silence). Fill first, then click.
+                    self._step(self._fill_prompt(
+                        page, min(deadline, time.time() + 12)))
                     self._step(self._click_generate_button(
                         page, min(deadline, time.time() + 12)))
                     wait_until = min(deadline, time.time() + 30)
@@ -770,23 +963,45 @@ class KeyManager:
                         self._step("key: not in page requests after "
                                    "Generate click (30s)")
 
-                    # -- Phase C: direct verifyUser fetch, x3 -----------
-                    for attempt in range(3):
-                        if (found or self._mint_stop.is_set()
-                                or time.time() > deadline - 10):
+                    # -- Phase C: verifyUser, three different ways ------
+                    # The old Phase C retried the SAME in-page fetch x3,
+                    # but on the live Colab mint every attempt threw (a
+                    # cross-origin fetch from perchance.org to
+                    # image-generation.perchance.org hits CORS, so it
+                    # throws "Failed to fetch"). Phase C now escalates:
+                    # (1) in-page fetch (exact error recorded),
+                    # (2) context API request (same cookies, no CORS),
+                    # (3) navigate to the verifyUser URL (the reference
+                    # client's approach — a navigation is never
+                    # CORS-blocked, and the response listener captures
+                    # the key from the JSON body).
+                    methods = [
+                        ("fetch",
+                         lambda: _try_verify_fetch(page)),
+                        ("api-request",
+                         lambda: _try_verify_api_request(ctx)),
+                        ("navigate",
+                         lambda: _try_verify_navigate(page)),
+                    ]
+                    for name, fn in methods:
+                        if found or self._mint_stop.is_set():
                             break
-                        if _try_verify_fetch(page):
-                            self._step(
-                                "verifyUser: fetch returned a key "
-                                f"(attempt {attempt + 1})")
+                        if time.time() > deadline - 8:
+                            self._step(f"verifyUser: {name} skipped "
+                                       "(budget left)")
+                            break
+                        if fn():
+                            self._step(f"verifyUser: {name} returned a key")
                             break
                         self._step(
-                            "verifyUser: fetch attempt "
-                            f"{attempt + 1} no key (last HTTP "
+                            f"verifyUser: {name} no key (last HTTP "
                             f"{verify_statuses[-1] if verify_statuses else '?'})")
-                        _humanize(page)
-                        page.wait_for_timeout(
-                            random.randint(5000, 8000))
+                        if (not found and not self._mint_stop.is_set()
+                                and name != "navigate"
+                                and time.time() < deadline - 8):
+                            _humanize(page)
+                            page.wait_for_timeout(
+                                random.randint(3000, 5000))
                     ctx.close()
                 finally:
                     self._active_browser = None
