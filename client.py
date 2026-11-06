@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Perchance image-generation client + automatic userKey management.
 
-Reverse-engineered from the Perchance generator page
-(https://perchance.org/b7kc35yv7u — the reference client's page; the
-ai-text-to-image-generator page was abandoned 2026-11-06 after
-Turnstile refused keys there in every browser mode). There is NO
+Reverse-engineered from the Perchance embed page
+(https://image-generation.perchance.org/embed — the mint page since
+2026-11-06; the generator pages ai-text-to-image-generator and
+b7kc35yv7u were both abandoned after Turnstile refused keys there in
+every browser mode). There is NO
 official public API — this replays the browser's own calls to the
 internal backend
 ``https://image-generation.perchance.org/api``:
@@ -27,8 +28,9 @@ browser/machine does NOT work — the backend returns ``invalid_key``. So the
 key MUST be minted on the same machine that calls the API. ``KeyManager``
 does exactly that: on first use (and whenever the backend says
 ``invalid_key``) it launches a real Chromium browser (HEADED, under Xvfb —
-see HEADED MINT below), opens the generator page, lets Turnstile pass, and
-captures the key from the page's own API calls. The key is cached in memory
+see HEADED MINT below), opens the embed page, lets Turnstile pass, and
+captures the key from the embed origin's localStorage (and from the
+page's own API calls, as before). The key is cached in memory
 and in ``userkey.txt`` so restarts reuse it while it is still valid
 (hours-days).
 
@@ -180,13 +182,42 @@ direct generate calls now use the same channel.
 Honest odds: the reference client was written for a DESKTOP machine
 (local Chrome, residential IP) — there is no evidence it works on a
 datacentre IP, and Turnstile scores the IP as well as the browser.
-The b7kc35yv7u page may simply have a different (simpler) Turnstile
-setup, or it may share the same one and fail the same way. This is
-the last untried page and the only documented working flow, so it is
-worth the attempt — but if the live Colab trail shows
-turnstileClientFail again on this page, Turnstile refuses keys to
-ANY automated browser on a cloud IP regardless of page, and the
-automated mint is definitively dead for $0.
+Outcome (2026-11-06, 18:58 IST): it failed the same way —
+turnstileClientFail twice on the live Colab run (prompt filled,
+Generate clicked, cf_clearance present, /api/generate never fired).
+The b7kc35yv7u page shares the generator pages' Turnstile setup. The
+mint moved to the embed page (see EMBED-PAGE MINT below) — the one
+untried page.
+
+EMBED-PAGE MINT (2026-11-06) — the one untried approach, from the
+GitHub deep-research round (53 repos;
+~/workspace/research_notes/perchance-github-tricks-20261106/report.md).
+pophvllo-art/perchance-mcp mints on the embed page directly
+(image-generation.perchance.org/embed) and reads the key from
+localStorage['userKey-0'] on the embed origin (on generator pages
+the key is localStorage['generation-v2:{browserId}:userKey-{thread}']).
+Three things are new vs. attempts 1-12: (1) the mint page is the
+embed, never a generator page; (2) the PRIMARY capture is a
+localStorage scan across all frames (kept alongside the existing
+network capture — request URL / POST body / response body / all
+/api/* logging); (3) the scan runs after page load AND during the
+Generate wait, because the key may land in storage just from the
+page loading and Turnstile passing. The mint is robust to the
+embed's structure: if a prompt box / Generate button exists it is
+used (same selectors as the generator pages — the embed IS the
+generator UI); if neither exists the mint still waits and scans
+storage + network. Honest odds ~15-25%: storage-reading removes a
+whole class of capture flakiness but does NOT skip Turnstile — the
+key only appears in localStorage after a trusted IP passes it.
+The direct verifyUser-with-accessCode shortcut is deliberately NOT
+implemented: it is real but IP-gated (verifyUser answers
+{"status":"failed_verification","reason":"token_required"} from
+cloud IPs — verified live from this VM 2026-11-06 and by
+CerberusLD §18.1 from Render, all TLS impersonations). If
+turnstileClientFail recurs on the embed page too, the automated
+mint is definitively dead for $0 (proven across 3 hosts, 3 pages,
+headless + headed, Chromium, stealth + plain, browserless +
+browser, and every capture method).
 """
 
 import json
@@ -205,7 +236,17 @@ import httpx
 logger = logging.getLogger(__name__)
 
 BASE = "https://image-generation.perchance.org/api"
-GENERATOR_PAGE = "https://perchance.org/b7kc35yv7u"
+# Mint page: the Perchance EMBED page. Verified against
+# pophvllo-art/perchance-mcp app/browser.py (read live 2026-11-06):
+# the embed is loaded at https://image-generation.perchance.org/embed
+# (optionally with a URL-hash JSON config, e.g. #{"prompt":"warmup"}).
+# All previous mint pages were generator pages
+# (ai-text-to-image-generator, then b7kc35yv7u — both failed with
+# turnstileClientFail on cloud IPs); the embed page was never tried.
+# It is Perchance's native generation context, and the key lives in
+# ITS origin's localStorage (userKey-0), so the mint reads storage
+# instead of only watching network traffic.
+EMBED_PAGE = "https://image-generation.perchance.org/embed"
 
 # HARD mint budget (seconds). The mint used to run up to 150s+ with no
 # overall cap, and Render's 512 MB free instance died mid-mint (restart
@@ -281,6 +322,24 @@ _KEY_IN_URL_RE = re.compile(r"userKey=([0-9a-fA-F]{64})")
 # separators, then the 64 hex chars. Catches encodings the two patterns
 # above miss without matching bare hashes (the label must be present).
 _KEY_ANY_RE = re.compile(r'userKey[^0-9a-fA-F]{1,12}([0-9a-fA-F]{64})')
+
+# JS run in each frame by _scan_localstorage: returns the localStorage
+# entries that could hold a key (any name containing "userKey", plus
+# adAccessCode for diagnostics). Values are sliced — the Python side
+# validates the 64-hex shape and never logs a value.
+_STORAGE_SCAN_JS = """() => {
+  const out = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      if (k.indexOf('userKey') !== -1 || k === 'adAccessCode') {
+        out[k] = (localStorage.getItem(k) || '').slice(0, 128);
+      }
+    }
+  } catch (e) { out.__error = String(e && e.message ? e.message : e); }
+  return out;
+}"""
 
 # Host whose /api/* calls the mint logs in the step trail. Overridden
 # in tests to point at a localhost mock (the mock's /api/* calls must
@@ -573,7 +632,7 @@ class KeyManager:
                               if s.split(" ", 1)[1].startswith(
                                   ("widget:", "gate:", "generate:",
                                    "verifyUser:", "cookies:", "prompt:",
-                                   "api:", "key:")))
+                                   "api:", "key:", "storage:")))
             detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
@@ -818,31 +877,97 @@ class KeyManager:
         except Exception:
             return False
 
+    def _scan_localstorage(self, page):
+        """Scan every frame's localStorage for a minted userKey.
+
+        EMBED MINT (2026-11-06): the key lives in storage, not (only)
+        in network traffic. On the embed origin it is
+        ``localStorage['userKey-0']`` (pophvllo-art/perchance-mcp,
+        JS_READ_IDENTITY); on generator-page origins it is
+        ``localStorage['generation-v2:{browserId}:userKey-{thread}']``
+        (Yuser00123, CerberusLD). Any key whose NAME contains
+        "userKey" and whose VALUE is exactly 64 hex chars counts —
+        that covers both schemes and any future variant. The
+        adAccessCode (also 64 hex, in the embed origin's storage) is
+        recorded as present/absent only — it is NOT a userKey and is
+        never returned.
+
+        Returns (key_or_None, status_string). The status names the
+        storage key and frame URL found, but NEVER logs a key value:
+        a 64-hex secret must not land in the step trail (/health) or
+        logs. Never raises: an unreadable frame (cross-origin,
+        about:blank, ad iframe) is skipped, and a missing key is a
+        normal outcome, not an error. ALL frames are scanned (no
+        perchance.org filter — the embed origin IS the top frame, and
+        a storage read is cheap, unlike the slow inner_text() scans
+        that forced the filter in _fill_prompt/_click_generate_button).
+        """
+        frames_checked = 0
+        ad_seen = False
+        try:
+            frames = list(page.frames)
+        except Exception:
+            return None, "storage: scan failed (no frames)"
+        for frame in frames:
+            if self._mint_stop.is_set():
+                return None, "storage: aborted (mint stopped)"
+            try:
+                url = frame.url or "?"
+            except Exception:
+                continue
+            try:
+                data = frame.evaluate(_STORAGE_SCAN_JS)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            frames_checked += 1
+            if "adAccessCode" in data:
+                ad_seen = True
+            for name, val in data.items():
+                if name in ("__error", "adAccessCode"):
+                    continue
+                if ("userKey" in name and isinstance(val, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{64}", val)):
+                    return val, (f"storage: {name} found "
+                                 f"(frame {url[:70]})")
+        suffix = ("; adAccessCode present" if ad_seen else "")
+        return None, (f"storage: no userKey in {frames_checked} "
+                      f"frame(s){suffix}")
+
     def _mint_via_browser(self, timeout=_MINT_TIMEOUT):
-        """Open the generator page in a stealth browser and capture the
+        """Open the embed page in a stealth browser and capture the
         userKey. Returns the key or None.
 
         Phased flow (learned from the reference client webgenimg, whose
-        browser flow is the only documented one that works):
+        browser flow is the only documented one that works, plus the
+        embed-page design of pophvllo-art/perchance-mcp):
 
-        A. Load the real generator page; let Turnstile's managed
+        A. Load the embed page; let Turnstile's managed
            challenge run. If a Turnstile widget iframe is visible,
            click it like a human; click the "I am over 18" content
-           gate if the page shows one. Check the cf_clearance cookie.
-        B. FILL A DUMMY PROMPT ("a red rose") in the generator's prompt
-           box, THEN click the Generate button in the generator iframe.
-           This is the step the old mint was missing twice over: the
-           page only calls /api/verifyUser and /api/generate after a
-           real Generate click — and it validates the prompt first, so
-           a Generate click with an EMPTY prompt fires nothing at all
-           (the live Colab mint: Turnstile passed, Generate clicked,
-           30s of silence). The key is captured from ANY request URL
+           gate if the page shows one (the embed page likely has
+           none). Check the cf_clearance cookie, then scan
+           localStorage — the key may already be there from the page
+           load alone, no Generate click needed.
+        B. FILL A DUMMY PROMPT ("a red rose") in the prompt box (if
+           the embed page has one — it IS the generator UI, so it
+           should), THEN click the Generate button. This is the step
+           the old mint was missing twice over: the page only calls
+           /api/verifyUser and /api/generate after a real Generate
+           click — and it validates the prompt first, so a Generate
+           click with an EMPTY prompt fires nothing at all (the live
+           Colab mint: Turnstile passed, Generate clicked, 30s of
+           silence). The key is captured from ANY request URL
            carrying userKey=..., from POST bodies (JSON/form), and
            from /api/* response bodies — the live Colab mint proved
-           the URL alone is not where the key lives — and every /api/*
-           call is logged, so the trail shows whether generate fired
-           at all. The widget is re-checked during the wait — the
-           challenge can also appear only after Generate is clicked.
+           the URL alone is not where the key lives — AND from
+           localStorage, re-scanned every 10s during the wait (the
+           key may land in storage with no new network traffic at
+           all). Every /api/* call is logged, so the trail shows
+           whether generate fired at all. The widget is re-checked
+           during the wait — the challenge can also appear only after
+           Generate is clicked.
         C. If still no key, verifyUser three different ways: in-page
            fetch (exact error recorded), context API request (same
            cookies, no CORS), navigate to the verifyUser URL (the
@@ -1172,7 +1297,7 @@ class KeyManager:
 
                     # -- Phase A: load the page, face the challenge -----
                     try:
-                        page.goto(GENERATOR_PAGE,
+                        page.goto(EMBED_PAGE,
                                   wait_until="domcontentloaded",
                                   timeout=30000)
                         self._step("page: loaded "
@@ -1203,6 +1328,15 @@ class KeyManager:
                     clearance = self._check_cf_clearance(ctx)
                     self._step("cookies: cf_clearance "
                                f"{'present' if clearance else 'absent'}")
+                    # EMBED MINT: the key may already be in localStorage
+                    # once Turnstile passes — the embed page mints it on
+                    # load, no Generate click needed. Scan now; if a key
+                    # is already there, Phase B is skipped.
+                    skey, sstatus = self._scan_localstorage(page)
+                    self._step(sstatus)
+                    if skey:
+                        found.append(skey)
+                        found_sources.append("localStorage")
 
                     # -- Phase B: fill a dummy prompt, click Generate,
                     #    wait for the key --------------------------------
@@ -1211,25 +1345,48 @@ class KeyManager:
                     # click fires nothing and no userKey ever appears
                     # (live Colab mint: Turnstile passed, Generate
                     # clicked, 30s of silence). Fill first, then click.
-                    self._step(self._fill_prompt(
-                        page, min(deadline, time.time() + 12)))
-                    self._step(self._click_generate_button(
-                        page, min(deadline, time.time() + 12)))
-                    wait_until = min(deadline, time.time() + 30)
-                    last_widget_check = 0
-                    while (not found and not self._mint_stop.is_set()
-                           and time.time() < wait_until):
-                        page.wait_for_timeout(1000)
-                        now = time.time()
-                        # Human-like movement while waiting, and re-check
-                        # the widget — the challenge can appear only
-                        # AFTER Generate is clicked.
-                        if now - last_widget_check >= 10:
-                            last_widget_check = now
-                            _humanize(page)
-                            status = self._click_turnstile_widget(page)
-                            if status == "widget: clicked":
-                                self._step(status)
+                    # On the EMBED page the prompt box / Generate button
+                    # may not exist at all — fill/click then just report
+                    # "not found" and the mint still waits and scans
+                    # storage + network below (the key may land in
+                    # localStorage from the page load alone).
+                    if not found:
+                        self._step(self._fill_prompt(
+                            page, min(deadline, time.time() + 12)))
+                        self._step(self._click_generate_button(
+                            page, min(deadline, time.time() + 12)))
+                        wait_until = min(deadline, time.time() + 30)
+                        last_widget_check = 0
+                        while (not found and not self._mint_stop.is_set()
+                               and time.time() < wait_until):
+                            page.wait_for_timeout(1000)
+                            now = time.time()
+                            # Human-like movement while waiting, and
+                            # re-check the widget — the challenge can
+                            # appear only AFTER Generate is clicked.
+                            # Also re-scan localStorage: the key may
+                            # land in storage mid-wait with no new
+                            # network traffic at all.
+                            if now - last_widget_check >= 10:
+                                last_widget_check = now
+                                _humanize(page)
+                                status = self._click_turnstile_widget(page)
+                                if status == "widget: clicked":
+                                    self._step(status)
+                                skey, sstatus = self._scan_localstorage(page)
+                                if skey:
+                                    found.append(skey)
+                                    found_sources.append("localStorage")
+                                    self._step(sstatus)
+                                    break
+                        if not found and not self._mint_stop.is_set():
+                            # One last storage scan — the key may have
+                            # landed in the final seconds of the wait.
+                            skey, sstatus = self._scan_localstorage(page)
+                            self._step(sstatus)
+                            if skey:
+                                found.append(skey)
+                                found_sources.append("localStorage")
                     if self._mint_stop.is_set():
                         self._step("key: aborted (mint stopped)")
                     elif found:
@@ -1253,6 +1410,15 @@ class KeyManager:
                     # client's approach — a navigation is never
                     # CORS-blocked, and the response listener captures
                     # the key from the JSON body).
+                    # NOTE (2026-11-06): do NOT add the "direct
+                    # verifyUser with accessCode" shortcut here. It is
+                    # real (verifyUser accepts ?accessCode=<ad-code>,
+                    # no browser, no Turnstile) but PROVEN DEAD from
+                    # cloud IPs: verifyUser answers
+                    # {"status":"failed_verification",
+                    #  "reason":"token_required"} from this VM and from
+                    # Render (CerberusLD §18.1, all TLS impersonations).
+                    # The browser mint is the only path left.
                     methods = [
                         ("fetch",
                          lambda: _try_verify_fetch(page)),
