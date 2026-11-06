@@ -52,6 +52,22 @@ more likely now but NOT guaranteed. If the mint still fails, /health shows
 the reason in ``last_key_error``; the fallbacks are the env-var key or a
 non-datacentre host.
 
+REFINED MINT (2026-11-06) — the first stealth deploy still failed
+("browser mint returned no key"), and reading the reference client
+(adrianx26/webgenimg, the only documented working browser flow) showed
+why: the page only calls /api/verifyUser and /api/generate AFTER a real
+Generate click — the old mint never clicked anything, so the page never
+yielded a key at all. The mint now (A) clicks a visible Turnstile widget
+if one appears, (B) clicks the "I am over 18" gate if shown, (C) clicks
+the Generate button in the generator iframe and captures the key from
+the /api/generate request URL (the old listener only watched verifyUser
+URLs and missed it), re-checking the widget while waiting, and (D) falls
+back to the direct in-page verifyUser fetch x3. Every step is logged to
+a trail surfaced in /health as last_mint_steps, so a failure says
+exactly where it died (widget? gate? generate click? verifyUser HTTP
+status?). If this still fails on Render, the remaining honest
+explanation is the datacentre IP itself — stealth cannot change it.
+
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
 on demand for a few seconds, then closed, so the steady-state server stays
@@ -222,6 +238,24 @@ class KeyManager:
         # browser failure was swallowed silently and nothing logged why).
         self._last_error = None
         self._last_attempt = None
+        # Step-by-step trail of the last browser mint (timestamped,
+        # capped). Surfaced via /health as last_mint_steps so a dead key
+        # can be diagnosed without Render logs: which step it died on.
+        self._mint_steps = []
+
+    def _step(self, msg):
+        """Record one mint step (timestamped, capped at 40 entries)."""
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        entry = f"{ts} {msg}"
+        self._mint_steps.append(entry)
+        if len(self._mint_steps) > 40:
+            self._mint_steps = self._mint_steps[-40:]
+        logger.info("Perchance mint: %s", msg)
+
+    @property
+    def mint_steps(self):
+        """Copy of the step trail from the last browser mint attempt."""
+        return list(self._mint_steps)
         # 1) explicit env var wins
         env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
         if env_key:
@@ -291,16 +325,20 @@ class KeyManager:
         """Mint a key via headless Chromium. Caller must hold the lock."""
         # Never mint from an env/file key we already invalidated: clear it.
         self._last_attempt = time.time()
+        self._mint_steps = []
+        self._step("mint started")
         try:
             key = self._mint_via_browser()
         except Exception as e:  # noqa: BLE001 - record, don't crash the call
             self._last_error = f"mint crashed: {type(e).__name__}: {e}"
+            self._step(f"mint crashed: {self._last_error}")
             logger.warning("Perchance key mint crashed: %s", self._last_error)
             key = None
         if key:
             self._last_error = None
             self._key = key
             self._source = "browser"
+            self._step("key captured OK (source=browser)")
             logger.info("Perchance key minted via browser (source=browser)")
             try:
                 with open(self._key_file, "w") as f:
@@ -309,9 +347,17 @@ class KeyManager:
                 pass
             return key
         if not self._last_error:
+            # Build the summary from the step trail so /health shows
+            # exactly where the mint died (widget? generate click?
+            # verifyUser status?) instead of one generic sentence.
+            trail = "; ".join(s.split(" ", 1)[1] for s in self._mint_steps
+                              if s.split(" ", 1)[1].startswith(
+                                  ("widget:", "gate:", "generate:",
+                                   "verifyUser:", "cookies:")))
+            detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
-                                "verifyUser)")
+                                f"verifyUser){detail}")
         logger.warning("Perchance key mint failed: %s", self._last_error)
         # Browser path failed — fall back to env var if one appeared.
         env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
@@ -328,17 +374,147 @@ class KeyManager:
             self._source = "none"
 
     # -- browser minting -------------------------------------------------
-    def _mint_via_browser(self, timeout=120):
+    def _click_turnstile_widget(self, page):
+        """Find a Cloudflare Turnstile widget iframe and click it like a
+        human. The widget lives in an iframe from
+        challenges.cloudflare.com; it may sit on the main page or inside
+        the generator iframe, so every frame's document is searched.
+        Returns a short status string for the step trail."""
+        try:
+            for frame in page.frames:
+                try:
+                    loc = frame.locator(
+                        'iframe[src*="challenges.cloudflare.com"]')
+                    if loc.count() == 0:
+                        continue
+                    box = loc.first.bounding_box(timeout=2000)
+                    if not box or box["width"] < 5 or box["height"] < 5:
+                        return ("widget: present but hidden "
+                                "(managed/invisible mode?)")
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    page.mouse.move(cx, cy, steps=random.randint(6, 12))
+                    page.wait_for_timeout(random.randint(300, 800))
+                    page.mouse.click(cx, cy)
+                    return "widget: clicked"
+                except Exception:
+                    continue
+            # No iframe found — is Turnstile even on this page?
+            try:
+                present = page.evaluate(
+                    "() => !!document.querySelector("
+                    "'iframe[src*=\\'challenges.cloudflare.com\\']') || "
+                    "!!window.turnstile")
+            except Exception:
+                present = False
+            return ("widget: none visible (managed/invisible mode?)"
+                    if not present else "widget: present, click failed")
+        except Exception as e:
+            return f"widget: check failed ({type(e).__name__})"
+
+    def _click_content_gate(self, page):
+        """Click the 'I am over 18 - Show Content' gate if the page shows
+        one (the reference client found it on fresh browser sessions).
+        Returns a short status string for the step trail."""
+        try:
+            btn = page.get_by_text("I am over 18", exact=False)
+            if btn.count() == 0:
+                return "gate: absent"
+            clicked = page.evaluate(
+                """() => {
+                    const b = document.getElementById("showContentBtn");
+                    if (b) { b.click(); return true; }
+                    return false;
+                }""")
+            if clicked:
+                return "gate: clicked (#showContentBtn)"
+            btn.first.click(timeout=5000)
+            return "gate: clicked (text match)"
+        except Exception as e:
+            return f"gate: check failed ({type(e).__name__})"
+
+    def _click_generate_button(self, page, deadline):
+        """Click a button whose text contains 'generate' in any frame.
+        This triggers the page's own verifyUser/generate calls — the
+        userKey appears in the /api/generate request URL. Returns a
+        short status string for the step trail."""
+        try:
+            for frame in page.frames:
+                if time.time() > deadline:
+                    return "generate: scan timed out"
+                try:
+                    buttons = frame.locator("button")
+                    n = buttons.count()
+                except Exception:
+                    continue
+                for i in range(min(n, 12)):
+                    try:
+                        b = buttons.nth(i)
+                        text = b.inner_text(timeout=1500)
+                    except Exception:
+                        continue
+                    if "generate" not in text.lower():
+                        continue
+                    try:
+                        b.click(timeout=8000)
+                        return ("generate: clicked "
+                                f"({text.strip()[:40]!r})")
+                    except Exception as e:
+                        return ("generate: found "
+                                f"{text.strip()[:30]!r} but click failed "
+                                f"({type(e).__name__})")
+            return "generate: no button found in any frame"
+        except Exception as e:
+            return f"generate: scan failed ({type(e).__name__})"
+
+    @staticmethod
+    def _check_cf_clearance(context):
+        """True if Turnstile set the cf_clearance cookie — the tell that
+        the challenge actually passed (vs. merely not showing)."""
+        try:
+            return any(c["name"] == "cf_clearance"
+                       for c in context.cookies())
+        except Exception:
+            return False
+
+    def _mint_via_browser(self, timeout=150):
         """Open the generator page in a stealth browser and capture the
-        userKey from the /api/verifyUser call. Returns the key or None."""
+        userKey. Returns the key or None.
+
+        Phased flow (learned from the reference client webgenimg, whose
+        browser flow is the only documented one that works):
+
+        A. Load the real generator page; let Turnstile's managed
+           challenge run. If a Turnstile widget iframe is visible,
+           click it like a human; click the "I am over 18" content
+           gate if the page shows one. Check the cf_clearance cookie.
+        B. CLICK THE GENERATE BUTTON in the generator iframe. This is
+           the step the old mint was missing: the page only calls
+           /api/verifyUser and /api/generate (whose request URL
+           carries userKey=...) after a real Generate click. Without
+           it the page never yields a key at all, however long you
+           wait. The key is captured from ANY request URL carrying
+           userKey=... (generate URLs included), and the widget is
+           re-checked during the wait — the challenge can also appear
+           only after Generate is clicked.
+        C. If still no key, call verifyUser directly in the page
+           context (x3, long waits) — the old path, kept as fallback.
+
+        Every step is recorded in self._mint_steps so /health shows
+        exactly where a failed mint died. Overall budget ``timeout``
+        seconds for phases B/C (page load has its own bounded
+        timeouts); the browser is closed in ``finally``.
+        """
         sync_playwright, engine_name, launch_args = _load_browser_engine()
         if sync_playwright is None:
             self._last_error = ("No stealth browser installed on this host "
                                 "(patchright missing; playwright also missing)")
+            self._step(f"engine: none — {self._last_error}")
             logger.warning("Perchance key mint: %s", self._last_error)
             return None
 
         found = []
+        verify_statuses = []
 
         def _capture(text):
             if not text:
@@ -353,21 +529,39 @@ class KeyManager:
 
         def _try_verify_fetch(page):
             """Ask for a key directly inside the page context — Turnstile
-            cookies are already set by now. Returns True if a key landed."""
+            cookies are already set by now. Returns True if a key landed.
+            Records the HTTP status / body kind in verify_statuses so a
+            Cloudflare block page (403 HTML) is distinguishable from a
+            JSON reply without a key."""
             try:
                 data = page.evaluate(
                     """async () => {
                         const r = await fetch(
                           'https://image-generation.perchance.org/api/verifyUser?thread=0',
                           {credentials: 'include'});
-                        return await r.text();
+                        return r.status + ' ' + await r.text();
                     }""")
+                m = re.match(r"(\d{3})\s?(.*)$", data or "", re.S)
+                status, body = (m.group(1), m.group(2)) if m else ("?", "")
+                if "Attention Required" in body or \
+                        "challenges.cloudflare.com" in body:
+                    kind = "cf-challenge-page"
+                elif body.lstrip().startswith("{"):
+                    kind = "json"
+                elif not body.strip():
+                    kind = "empty"
+                else:
+                    kind = "html/other"
+                verify_statuses.append(f"{status} {kind}")
                 before = len(found)
                 _capture(data)
                 return len(found) > before
             except Exception:
+                verify_statuses.append("fetch-threw")
                 return False
 
+        start = time.time()
+        deadline = start + timeout
         try:
             with sync_playwright() as p:
                 # CRITICAL: channel="chromium" forces the FULL Chrome
@@ -377,6 +571,7 @@ class KeyManager:
                 # (Verified: plain launch looked for
                 # chromium_headless_shell-1248; channel="chromium" selects
                 # the full Chrome-for-Testing binary in new headless mode.)
+                self._step(f"engine: {engine_name} (full chromium)")
                 browser = p.chromium.launch(headless=True, args=launch_args,
                                             channel="chromium")
                 try:
@@ -388,30 +583,90 @@ class KeyManager:
                         timezone_id="America/Los_Angeles",
                     )
                     page = ctx.new_page()
-                    # Capture the key from any verifyUser request/response.
-                    page.on("request", lambda req: _capture(req.url)
-                            if "verifyUser" in req.url else None)
-                    page.on("response", lambda resp: _capture(_safe_text(resp))
-                            if "verifyUser" in resp.url else None)
-                    page.goto(GENERATOR_PAGE, wait_until="domcontentloaded",
-                              timeout=timeout * 1000)
-                    # Behave like a visitor: move the mouse, scroll, let
-                    # Turnstile's managed challenge observe real behaviour.
+
+                    def _on_request(req):
+                        # Capture from ANY request URL carrying userKey=...
+                        # — the key most reliably appears in the
+                        # /api/generate request URL after a Generate
+                        # click, not in verifyUser alone. The old
+                        # listener only watched verifyUser URLs and
+                        # missed that entirely.
+                        _capture(req.url)
+
+                    def _on_response(resp):
+                        if "verifyUser" in resp.url:
+                            try:
+                                verify_statuses.append(str(resp.status))
+                            except Exception:
+                                pass
+                            _capture(_safe_text(resp))
+
+                    page.on("request", _on_request)
+                    page.on("response", _on_response)
+
+                    # -- Phase A: load the page, face the challenge -----
+                    try:
+                        page.goto(GENERATOR_PAGE,
+                                  wait_until="domcontentloaded",
+                                  timeout=60000)
+                        self._step("page: loaded "
+                                   f"(title={page.title()[:60]!r})")
+                    except Exception as e:
+                        self._step(f"page: goto failed "
+                                   f"({type(e).__name__}: {e})")
+                        raise
                     _humanize(page)
                     try:
-                        page.wait_for_load_state("networkidle", timeout=30000)
+                        page.wait_for_load_state("networkidle", timeout=15000)
                     except Exception:
                         pass
-                    # Turnstile can take a few seconds to complete; retry
-                    # the verifyUser fetch a few times with random waits
-                    # instead of giving up after one try.
-                    for _ in range(3):
-                        if found:
+                    self._step("page: settled (networkidle or timeout)")
+                    self._step(self._click_turnstile_widget(page))
+                    self._step(self._click_content_gate(page))
+                    _humanize(page)
+                    clearance = self._check_cf_clearance(ctx)
+                    self._step("cookies: cf_clearance "
+                               f"{'present' if clearance else 'absent'}")
+
+                    # -- Phase B: click Generate, wait for the key ------
+                    self._step(self._click_generate_button(
+                        page, min(deadline, time.time() + 20)))
+                    wait_until = min(deadline, time.time() + 45)
+                    last_widget_check = 0
+                    while not found and time.time() < wait_until:
+                        page.wait_for_timeout(1000)
+                        now = time.time()
+                        # Human-like movement while waiting, and re-check
+                        # the widget — the challenge can appear only
+                        # AFTER Generate is clicked.
+                        if now - last_widget_check >= 10:
+                            last_widget_check = now
+                            _humanize(page)
+                            status = self._click_turnstile_widget(page)
+                            if status == "widget: clicked":
+                                self._step(status)
+                    if found:
+                        self._step("key: captured from page request URL")
+                    else:
+                        self._step("key: not in page requests after "
+                                   "Generate click (45s)")
+
+                    # -- Phase C: direct verifyUser fetch, x3 -----------
+                    for attempt in range(3):
+                        if found or time.time() > deadline - 10:
                             break
-                        page.wait_for_timeout(random.randint(3000, 6000))
-                        _humanize(page)
                         if _try_verify_fetch(page):
+                            self._step(
+                                "verifyUser: fetch returned a key "
+                                f"(attempt {attempt + 1})")
                             break
+                        self._step(
+                            "verifyUser: fetch attempt "
+                            f"{attempt + 1} no key (last HTTP "
+                            f"{verify_statuses[-1] if verify_statuses else '?'})")
+                        _humanize(page)
+                        page.wait_for_timeout(
+                            random.randint(8000, 15000))
                     ctx.close()
                 finally:
                     browser.close()
@@ -420,13 +675,15 @@ class KeyManager:
             # and /health only said key_cached:false.
             self._last_error = (f"browser mint failed [{engine_name}]: "
                                 f"{type(e).__name__}: {e}")
+            self._step(f"browser mint failed: {self._last_error}")
             logger.warning("Perchance key mint failed: %s",
                            self._last_error, exc_info=True)
             return None
         if not found:
+            self._step("key: NOT captured (all phases exhausted)")
             logger.warning("Perchance key mint: browser ran but no userKey "
-                           "was captured from verifyUser (Turnstile may "
-                           "have blocked this datacentre IP)")
+                           "was captured (Turnstile may have blocked this "
+                           "datacentre IP)")
         return found[-1] if found else None
 
 

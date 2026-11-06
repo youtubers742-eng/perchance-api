@@ -215,6 +215,10 @@ def health():
         # dig through Render logs, which previously showed nothing.
         "last_key_error": km.last_error,
         "last_key_attempt": km.last_attempt,
+        # Step-by-step trail of the last mint (page loaded? widget
+        # clicked? generate clicked? verifyUser HTTP status?) — says
+        # exactly where a failed mint died.
+        "last_mint_steps": km.mint_steps,
         "max_resolution": "768x768",
     }
 
