@@ -24,9 +24,7 @@ Run:  uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
 """
 
 import base64
-import logging
 import os
-import threading
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -35,8 +33,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from client import InvalidKeyError, KeyManager, PerchanceClient, PerchanceError
 from styles import NSFW_STYLES, STYLES, apply_style_full, list_styles
-
-logger = logging.getLogger(__name__)
 
 MODEL_ID = "perchance-image"
 MODEL_ID_UNCENSORED = "perchance-image-uncensored"
@@ -287,21 +283,16 @@ GET /health — see README.md for Open WebUI setup.</small></p>
 
 
 # --------------------------------------------------------------------------
-# startup: warm the userKey in the background (non-blocking) so the first
-# real request does not pay the browser-launch cost. If it fails, the first
-# generation will retry the refresh on demand.
+# No startup warm-up mint (REMOVED 2026-11-06): the old @app.on_event
+# handler launched a browser mint at boot, and on Render's 512 MB free
+# instance the mint died mid-flight and took the process with it — the
+# instance restarted, the mint ran again at startup, and the service
+# looped 502 forever. The server must start and answer /health instantly
+# with NO browser launch. The key is minted LAZILY, only when a
+# generation request actually arrives, in a worker thread with a hard
+# 90s timeout (see client.KeyManager). A cached env/file key means no
+# mint is needed at all.
 # --------------------------------------------------------------------------
-@app.on_event("startup")
-def _warm_key():
-    def _warm():
-        try:
-            _client.keys.get_key()
-        except Exception as e:  # noqa: BLE001 - log it; silent pass hid
-            # the mint failure until the first real generation failed.
-            logger.warning("Perchance startup key warm-up failed: %s", e,
-                           exc_info=True)
-    threading.Thread(target=_warm, daemon=True).start()
-
 
 if __name__ == "__main__":
     import uvicorn

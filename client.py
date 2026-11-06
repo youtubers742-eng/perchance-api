@@ -70,12 +70,14 @@ explanation is the datacentre IP itself — stealth cannot change it.
 
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
-on demand for a few seconds, then closed, so the steady-state server stays
-small. On a 512 MB host (e.g. Render free) the refresh may OOM — in that
-case set PERCHANCE_USER_KEY by hand instead. Patchright uses the same
-Chromium binary family, so its RAM is in the same range; Camoufox
-(Firefox-based, heavier, plus a separate browser download) was
-deliberately NOT used for this reason.
+on demand (LAZY — never at startup; the 2026-11-06 startup warm-up mint
+killed the Render instance into a restart loop, so it was removed), in a
+worker thread with a HARD 90s timeout that kills the browser on expiry,
+with the renderer capped to one process and a 256 MB V8 heap cap. The
+steady-state server stays small and /health always answers instantly.
+Patchright uses the same Chromium binary family, so its RAM is in the
+same range; Camoufox (Firefox-based, heavier, plus a separate browser
+download) was deliberately NOT used for this reason.
 
 UNCENSORED MODE — how Perchance actually selects it
 ---------------------------------------------------
@@ -123,6 +125,15 @@ logger = logging.getLogger(__name__)
 BASE = "https://image-generation.perchance.org/api"
 GENERATOR_PAGE = "https://perchance.org/ai-text-to-image-generator"
 
+# HARD mint budget (seconds). The mint used to run up to 150s+ with no
+# overall cap, and Render's 512 MB free instance died mid-mint (restart
+# loop, 502s): either OOM (full Chrome + heavy Perchance SPA) or the
+# health check failing while the server was stuck minting. The mint now
+# runs in a worker thread with this hard timeout — on expiry the browser
+# is killed and the caller gets the clean "no key" error. All phase
+# budgets inside _mint_via_browser must fit inside this number.
+_MINT_TIMEOUT = 90
+
 # A current desktop Chrome UA — the backend expects a browser-like client.
 # Linux UA on purpose: the binary runs on Linux, so navigator.platform
 # agrees with the UA (a Windows UA on a Linux binary is itself a tell).
@@ -157,6 +168,13 @@ _BASE_ARGS = [
     # containers and saves a little RAM.
     "--no-zygote",
     "--disable-software-rasterizer",
+    # RAM caps for 512 MB hosts (added 2026-11-06 after the refined mint
+    # OOM-killed the Render instance into a restart loop): one renderer
+    # process only, and a 256 MB V8 heap cap so the heavy Perchance SPA
+    # cannot grow the renderer without bound. 256 MB is enough for
+    # Turnstile + one Generate click; the browser is killed on timeout.
+    "--renderer-process-limit=1",
+    "--js-flags=--max-old-space-size=256",
 ]
 
 # Patchright path: Patchright already removes --enable-automation and adds
@@ -242,6 +260,35 @@ class KeyManager:
         # capped). Surfaced via /health as last_mint_steps so a dead key
         # can be diagnosed without Render logs: which step it died on.
         self._mint_steps = []
+        # Hard-timeout machinery (2026-11-06 crash fix): the mint runs in
+        # a worker thread; _mint_stop tells its wait loops to abort early
+        # and _active_browser lets the watchdog kill the browser on
+        # timeout. _mint_result is how the worker hands the key back.
+        self._mint_stop = threading.Event()
+        self._active_browser = None
+        self._mint_result = {"key": None}
+        # Load a usable key WITHOUT a browser: env var first, then the
+        # cached key file from a previous successful mint. This used to be
+        # dead code after a `return` in the mint_steps property, so a
+        # cached key was never reused and every restart paid for a mint.
+        self._load_initial_key()
+
+    def _load_initial_key(self):
+        """Pick up a key that needs no browser: PERCHANCE_USER_KEY env
+        var wins, else the cached key file from a previous mint."""
+        env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
+        if env_key:
+            self._key = env_key
+            self._source = "env"
+            return
+        if os.path.isfile(self._key_file):
+            try:
+                cached = open(self._key_file).read().strip()
+                if cached:
+                    self._key = cached
+                    self._source = "file"
+            except OSError:
+                pass
 
     def _step(self, msg):
         """Record one mint step (timestamped, capped at 40 entries)."""
@@ -256,21 +303,6 @@ class KeyManager:
     def mint_steps(self):
         """Copy of the step trail from the last browser mint attempt."""
         return list(self._mint_steps)
-        # 1) explicit env var wins
-        env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
-        if env_key:
-            self._key = env_key
-            self._source = "env"
-            return
-        # 2) cached key from a previous run
-        if os.path.isfile(key_file):
-            try:
-                cached = open(key_file).read().strip()
-                if cached:
-                    self._key = cached
-                    self._source = "file"
-            except OSError:
-                pass
 
     @property
     def key(self):
@@ -304,31 +336,63 @@ class KeyManager:
         except OSError:
             pass
 
-    def get_key(self):
-        """Return a usable key, minting one in a browser if we have none."""
+    def get_key(self, timeout=_MINT_TIMEOUT):
+        """Return a usable key, minting one in a browser if we have none.
+
+        The mint runs in a worker thread with a HARD timeout (default
+        90s): if it does not finish in time the browser is killed and
+        None is returned, so a generation request can never hang the
+        server for minutes or get the instance OOM-killed (the 2026-11-06
+        restart loop). A cached env/file key returns instantly, no mint.
+        """
         with self._lock:
             if self._key:
                 return self._key
-            return self.refresh_locked()
+            return self._mint_with_timeout(timeout)
 
-    def refresh(self, force=False):
+    def refresh(self, force=False, timeout=_MINT_TIMEOUT):
         """Force a fresh browser-minted key (used after invalid_key)."""
         with self._lock:
             if not force and self._key:
                 return self._key
-            # FIX: this used to call self._refresh_locked(), which does not
-            # exist — every invalid_key retry died with AttributeError
-            # instead of minting a fresh key.
-            return self.refresh_locked()
+            return self._mint_with_timeout(timeout)
 
-    def refresh_locked(self):
-        """Mint a key via headless Chromium. Caller must hold the lock."""
-        # Never mint from an env/file key we already invalidated: clear it.
+    def refresh_locked(self, timeout=_MINT_TIMEOUT):
+        """Mint a key via headless Chromium. Caller must hold the lock.
+        Kept for compatibility — delegates to the threaded mint."""
+        return self._mint_with_timeout(timeout)
+
+    def _env_fallback(self):
+        """Use the PERCHANCE_USER_KEY env var if one is set (it may have
+        appeared since startup). Returns the key or None."""
+        env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
+        if env_key:
+            self._key = env_key
+            self._source = "env"
+            return env_key
+        return None
+
+    def _close_active_browser(self):
+        """Best-effort kill of the mint's browser (watchdog path, called
+        from a different thread than the mint — Playwright may refuse a
+        cross-thread close, so this is wrapped; the mint's own internal
+        deadline is the real guarantee, this just hurries it)."""
+        browser = self._active_browser
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    def _mint_worker(self):
+        """Runs in the worker thread: the browser mint + result handling.
+        Never raises — records the failure and returns None via
+        _mint_result so the caller always gets a clean answer."""
         self._last_attempt = time.time()
         self._mint_steps = []
         self._step("mint started")
         try:
-            key = self._mint_via_browser()
+            key = self._mint_via_browser(timeout=_MINT_TIMEOUT)
         except Exception as e:  # noqa: BLE001 - record, don't crash the call
             self._last_error = f"mint crashed: {type(e).__name__}: {e}"
             self._step(f"mint crashed: {self._last_error}")
@@ -345,7 +409,8 @@ class KeyManager:
                     f.write(key)
             except OSError:
                 pass
-            return key
+            self._mint_result["key"] = key
+            return
         if not self._last_error:
             # Build the summary from the step trail so /health shows
             # exactly where the mint died (widget? generate click?
@@ -359,13 +424,35 @@ class KeyManager:
                                 "(Turnstile blocked or page never yielded "
                                 f"verifyUser){detail}")
         logger.warning("Perchance key mint failed: %s", self._last_error)
-        # Browser path failed — fall back to env var if one appeared.
-        env_key = os.environ.get("PERCHANCE_USER_KEY", "").strip()
-        if env_key:
-            self._key = env_key
-            self._source = "env"
-            return env_key
-        return None
+        self._mint_result["key"] = None
+
+    def _mint_with_timeout(self, timeout):
+        """Run the browser mint in a worker thread; hard-timeout it.
+
+        Caller must hold the lock (serialises concurrent mints). On
+        timeout: signal the mint to stop, try to kill its browser
+        immediately, record the timeout, and fall back to the env var.
+        Returns the key or None — never hangs past ``timeout`` seconds.
+        """
+        self._mint_stop.clear()
+        self._mint_result = {"key": None}
+        worker = threading.Thread(target=self._mint_worker, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            # HARD TIMEOUT — the mint is still running past its budget.
+            # Stop it: flag the wait loops, kill the browser now.
+            self._mint_stop.set()
+            self._close_active_browser()
+            self._last_error = (f"browser mint timed out after {timeout}s "
+                                "(hard timeout; browser killed)")
+            self._step(f"mint timed out after {timeout}s (hard timeout)")
+            logger.warning("Perchance key mint timed out after %ss", timeout)
+            return self._env_fallback()
+        key = self._mint_result["key"]
+        if key:
+            return key
+        return self._env_fallback()
 
     def invalidate(self):
         """Drop the cached key so the next call mints a fresh one."""
@@ -382,6 +469,8 @@ class KeyManager:
         Returns a short status string for the step trail."""
         try:
             for frame in page.frames:
+                if self._mint_stop.is_set():
+                    return "widget: aborted (mint stopped)"
                 try:
                     loc = frame.locator(
                         'iframe[src*="challenges.cloudflare.com"]')
@@ -437,17 +526,34 @@ class KeyManager:
         """Click a button whose text contains 'generate' in any frame.
         This triggers the page's own verifyUser/generate calls — the
         userKey appears in the /api/generate request URL. Returns a
-        short status string for the step trail."""
+        short status string for the step trail.
+
+        Only perchance.org frames are scanned: the page also loads ad
+        iframes, and inner_text() on cross-origin ad frames is slow
+        (1.5s timeout each) — scanning them burned most of the mint
+        budget before the real button was ever reached."""
         try:
             for frame in page.frames:
+                if self._mint_stop.is_set():
+                    return "generate: aborted (mint stopped)"
                 if time.time() > deadline:
                     return "generate: scan timed out"
+                try:
+                    url = frame.url or ""
+                except Exception:
+                    continue
+                if "perchance.org" not in url:
+                    continue
                 try:
                     buttons = frame.locator("button")
                     n = buttons.count()
                 except Exception:
                     continue
                 for i in range(min(n, 12)):
+                    if self._mint_stop.is_set():
+                        return "generate: aborted (mint stopped)"
+                    if time.time() > deadline:
+                        return "generate: scan timed out"
                     try:
                         b = buttons.nth(i)
                         text = b.inner_text(timeout=1500)
@@ -477,7 +583,7 @@ class KeyManager:
         except Exception:
             return False
 
-    def _mint_via_browser(self, timeout=150):
+    def _mint_via_browser(self, timeout=_MINT_TIMEOUT):
         """Open the generator page in a stealth browser and capture the
         userKey. Returns the key or None.
 
@@ -502,8 +608,12 @@ class KeyManager:
 
         Every step is recorded in self._mint_steps so /health shows
         exactly where a failed mint died. Overall budget ``timeout``
-        seconds for phases B/C (page load has its own bounded
-        timeouts); the browser is closed in ``finally``.
+        seconds (HARD — 90s; the old 150s budget plus unbounded phase
+        waits let the mint outlive the host and kill the instance).
+        The browser object is stored in self._active_browser so the
+        watchdog can kill it on timeout, and every wait loop checks
+        self._mint_stop so an abort lands fast. The browser is closed
+        in ``finally``.
         """
         sync_playwright, engine_name, launch_args = _load_browser_engine()
         if sync_playwright is None:
@@ -574,6 +684,9 @@ class KeyManager:
                 self._step(f"engine: {engine_name} (full chromium)")
                 browser = p.chromium.launch(headless=True, args=launch_args,
                                             channel="chromium")
+                # Watchdog handle: _mint_with_timeout can kill this
+                # browser from another thread if the hard timeout fires.
+                self._active_browser = browser
                 try:
                     ctx = browser.new_context(
                         user_agent=UA,
@@ -608,7 +721,7 @@ class KeyManager:
                     try:
                         page.goto(GENERATOR_PAGE,
                                   wait_until="domcontentloaded",
-                                  timeout=60000)
+                                  timeout=30000)
                         self._step("page: loaded "
                                    f"(title={page.title()[:60]!r})")
                     except Exception as e:
@@ -617,7 +730,10 @@ class KeyManager:
                         raise
                     _humanize(page)
                     try:
-                        page.wait_for_load_state("networkidle", timeout=15000)
+                        # The Perchance SPA may never reach networkidle
+                        # (ads/analytics keep connections open) — 8s is
+                        # enough; the old 15s just burned budget.
+                        page.wait_for_load_state("networkidle", timeout=8000)
                     except Exception:
                         pass
                     self._step("page: settled (networkidle or timeout)")
@@ -630,10 +746,11 @@ class KeyManager:
 
                     # -- Phase B: click Generate, wait for the key ------
                     self._step(self._click_generate_button(
-                        page, min(deadline, time.time() + 20)))
-                    wait_until = min(deadline, time.time() + 45)
+                        page, min(deadline, time.time() + 12)))
+                    wait_until = min(deadline, time.time() + 30)
                     last_widget_check = 0
-                    while not found and time.time() < wait_until:
+                    while (not found and not self._mint_stop.is_set()
+                           and time.time() < wait_until):
                         page.wait_for_timeout(1000)
                         now = time.time()
                         # Human-like movement while waiting, and re-check
@@ -645,15 +762,18 @@ class KeyManager:
                             status = self._click_turnstile_widget(page)
                             if status == "widget: clicked":
                                 self._step(status)
-                    if found:
+                    if self._mint_stop.is_set():
+                        self._step("key: aborted (mint stopped)")
+                    elif found:
                         self._step("key: captured from page request URL")
                     else:
                         self._step("key: not in page requests after "
-                                   "Generate click (45s)")
+                                   "Generate click (30s)")
 
                     # -- Phase C: direct verifyUser fetch, x3 -----------
                     for attempt in range(3):
-                        if found or time.time() > deadline - 10:
+                        if (found or self._mint_stop.is_set()
+                                or time.time() > deadline - 10):
                             break
                         if _try_verify_fetch(page):
                             self._step(
@@ -666,9 +786,10 @@ class KeyManager:
                             f"{verify_statuses[-1] if verify_statuses else '?'})")
                         _humanize(page)
                         page.wait_for_timeout(
-                            random.randint(8000, 15000))
+                            random.randint(5000, 8000))
                     ctx.close()
                 finally:
+                    self._active_browser = None
                     browser.close()
         except Exception as e:  # noqa: BLE001 - log the real reason; the
             # old code swallowed this silently, so Render logs showed nothing
