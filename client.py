@@ -285,6 +285,48 @@ unchanged. Honest odds: this is the last untried mechanism from the
 reference's design — if the UI still does not render inside the
 iframe, the automated mint has exhausted the reference's whole
 playbook.
+
+BYPASS-CSP (TRIED AND DISPROVEN, 2026-11-06 ~21:12 IST) — the
+wrapper ALSO failed (15th attempt, live Colab): "wrapper: no embed
+iframe appeared (15s)". Root cause, proven by a direct header
+check: the embed page sends Content-Security-Policy:
+frame-ancestors 'self' https://*.perchance.org
+https://perchance.org — it can ONLY be framed by Perchance origins
+(the generator page sends X-Frame-Options: sameorigin — same
+story). browser.new_context(bypass_csp=True) was tried as the fix
+and DISPROVEN by mock test (test_bypass_csp.py): a CSP-locked mock
+embed (frame-ancestors 'none') fails identically with and without
+the bypass, on BOTH engines (Camoufox/Firefox and Chromium) and
+with BOTH wrapper shapes (set_content and a real HTTP parent page)
+— the iframe stays blank / chrome-error in every run. bypass_csp
+only bypasses a page's own content CSP, not the browser-level
+frame-ancestors embedding check. Do NOT re-try bypass_csp. The
+flag was reverted out of _mint_browser. The remaining mechanism —
+stripping the CSP header itself (response interception) — is now
+the mint's CSP-STRIPPING fix, below.
+
+CSP-STRIPPING MINT (2026-11-06 ~21:24 IST) — bypass_csp attacks
+the wrong layer: it only bypasses a page's own content CSP, never
+the browser-level frame-ancestors embedding check. Stripping
+attacks the header itself: before the wrapper iframe navigates,
+the mint registers a page.route handler matching the embed
+document URL; the handler re-fetches the response (route.fetch),
+removes the Content-Security-Policy header (and X-Frame-Options
+if present), and fulfills with the ORIGINAL body byte-for-byte
+(route.fulfill(response=resp, headers=stripped)). The browser
+never sees the frame-ancestors directive, so the iframe loads
+and the embed UI can render. The handler is registered BEFORE
+page.set_content — the check happens at navigation time, so a
+later registration would be too late. On any interception failure
+the handler falls back to route.continue_(), degrading to the old
+behaviour instead of dying. Proven by mock test
+(test_csp_strip.py): a CSP/XFO-locked mock embed renders and drops
+its key into localStorage with stripping, and fails with "no embed
+iframe appeared" without it (control). Honest odds: this is the
+last untried mechanism for the embed approach — if the UI still
+does not render on the live page, the automated mint has exhausted
+every mechanism in the reference's playbook and the remaining
+paths are Cloady (fresh IPs) or a key from a real browser.
 """
 
 from contextlib import contextmanager
@@ -355,6 +397,21 @@ def _embed_url(prompt, resolution="512x512", seed=-1, guidance=7,
     }
     blob = json.dumps(hash_data, separators=(",", ":"))
     return EMBED_PAGE + "#" + quote(blob)
+
+
+# CSP-STRIPPING (2026-11-06 ~21:24 IST) — see the module docstring.
+# True (default): _load_embed_wrapper registers a route handler
+# that strips the embed response's framing headers before the
+# wrapper iframe navigates. The mock test sets this False for its
+# control run (no stripping must reproduce "no embed iframe
+# appeared"). There is no user-facing reason to turn this off.
+_STRIP_CSP = True
+
+# Matches exactly the embed document URL. The hash config is never
+# sent to the server, so the request has no fragment and (for the
+# real embed) no query. Deliberately narrow: only the embed page's
+# own framing headers are stripped; its subresources flow untouched.
+_EMBED_ROUTE_RE = re.compile(r"^https?://[^/]+/embed(\?[^#]*)?$")
 
 
 def _embed_frame(page):
@@ -792,7 +849,7 @@ class KeyManager:
                                   ("widget:", "gate:", "generate:",
                                    "verifyUser:", "cookies:", "prompt:",
                                    "api:", "key:", "storage:", "wrapper:",
-                                   "embed UI")))
+                                   "embed UI", "csp:")))
             detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
@@ -1095,6 +1152,46 @@ class KeyManager:
         return None, (f"storage: no userKey in {frames_checked} "
                       f"frame(s){suffix}")
 
+    def _strip_embed_csp(self, route):
+        """Route handler: re-fetch the embed document, strip its
+        framing headers, fulfill with the body preserved.
+
+        The embed page sends Content-Security-Policy:
+        frame-ancestors 'self' https://*.perchance.org
+        https://perchance.org, so the browser refuses to load it in
+        our wrapper iframe at navigation time — bypass_csp cannot
+        help (it only bypasses a page's own content CSP, not the
+        browser-level frame-ancestors check; disproven 2026-11-06).
+        Stripping the header at the network layer means the browser
+        never sees the directive at all. route.fetch() re-issues the
+        request through the context (same cookies, and it does NOT
+        re-enter routing, so no loop); route.fulfill(response=resp,
+        headers=stripped) serves the ORIGINAL body byte-for-byte
+        with only the two framing headers removed — a broken fulfill
+        would break the embed worse than the CSP does, so nothing
+        else about the response is touched. On any failure, fall
+        back to route.continue_() so the mint degrades to the old
+        behaviour instead of dying inside the handler. The strip is
+        logged once per mint (first successful fulfill) so the trail
+        shows whether interception actually fired."""
+        try:
+            resp = route.fetch()
+            headers = {k: v for k, v in resp.headers.items()
+                       if k.lower() not in ("content-security-policy",
+                                            "x-frame-options")}
+            route.fulfill(response=resp, headers=headers)
+            if not getattr(self, "_csp_stripped", False):
+                self._csp_stripped = True
+                self._step("csp: stripped Content-Security-Policy + "
+                           "X-Frame-Options from embed response")
+        except Exception as e:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+            self._step(f"csp: strip failed ({type(e).__name__}) — "
+                       "continuing without interception")
+
     def _load_embed_wrapper(self, page, mint_url, deadline):
         """Host the embed in a full-viewport iframe on a minimal
         wrapper page (see IFRAME-WRAPPER MINT in the module docstring)
@@ -1128,6 +1225,23 @@ class KeyManager:
             f"<iframe id='genFrame' src='{escaped}' "
             "style='position:fixed;top:0;left:0;width:100%;height:100%;"
             "border:0'></iframe></body></html>")
+        # CSP-STRIPPING: register the route BEFORE the iframe
+        # navigates — the frame-ancestors check happens at navigation
+        # time, so a handler registered after set_content would be
+        # too late. Only the embed document URL is matched; every
+        # other request (wrapper, subresources, /api/*) flows
+        # untouched. Reset the one-shot strip log per mint attempt.
+        self._csp_stripped = False
+        if _STRIP_CSP:
+            try:
+                page.route(_EMBED_ROUTE_RE, self._strip_embed_csp)
+                self._step("csp: stripping framing headers from "
+                           "embed response")
+            except Exception as e:
+                self._step(f"csp: route registration failed "
+                           f"({type(e).__name__}) — continuing unstripped")
+        else:
+            self._step("csp: strip disabled (control run)")
         try:
             page.set_content(wrapper, timeout=15000)
         except Exception as e:
