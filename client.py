@@ -33,11 +33,63 @@ the manager falls back to the ``PERCHANCE_USER_KEY`` env var / ``userkey.txt``
 — i.e. a key you paste in by hand. If neither works, generation raises a
 clear error instead of silently failing.
 
+STEALTH — why Patchright, and its honest limit
+-----------------------------------------------
+Plain Playwright Chromium is trivially detectable (``--enable-automation``,
+``navigator.webdriver``, ``Runtime.enable``/``Console.enable`` CDP leaks)
+and Cloudflare Turnstile blocks it on datacentre IPs — that is exactly
+what happened on Render. So the mint uses **Patchright**, a patched
+Playwright drop-in: it removes the automation flags, executes JS in
+isolated contexts (no ``Runtime.enable`` leak), disables the Console API
+leak, and passes Cloudflare's fingerprint checks. On top of that the mint
+moves the mouse like a human, scrolls, and waits with random delays
+instead of fixed ones, and retries the verifyUser call a few times
+(Turnstile can take seconds to complete).
+
+Honest limit: stealth fixes the *browser fingerprint* — it cannot change
+the *datacentre IP*. Turnstile scores the IP too, so a pass on Render is
+more likely now but NOT guaranteed. If the mint still fails, /health shows
+the reason in ``last_key_error``; the fallbacks are the env-var key or a
+non-datacentre host.
+
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
 on demand for a few seconds, then closed, so the steady-state server stays
 small. On a 512 MB host (e.g. Render free) the refresh may OOM — in that
-case set PERCHANCE_USER_KEY by hand instead.
+case set PERCHANCE_USER_KEY by hand instead. Patchright uses the same
+Chromium binary family, so its RAM is in the same range; Camoufox
+(Firefox-based, heavier, plus a separate browser download) was
+deliberately NOT used for this reason.
+
+UNCENSORED MODE — how Perchance actually selects it
+---------------------------------------------------
+There is NO separate "uncensored model" parameter in the generate
+request, and no model field at all. The NSFW/SFW axis is controlled by
+two things, both documented in the reverse-engineered b7kc35yv7u client
+(adrianx26/webgenimg, perchance_client.py + extracted_styles.json):
+
+  1. ``subChannel``: ``"nsfw"`` instead of ``"public"`` in the /generate
+     body — the backend-level switch (``target_sub_channel = ... "nsfw"
+     if adult_mode else "public"``).
+  2. Adult prompt composition (``compose_prompt``): if "nsfw" is not
+     already in the prompt, append ``", (nsfw:1.2), mature, highly
+     detailed"``; if "nsfw" is in the negative prompt, strip the
+     anti-NSFW terms (nsfw / nudity / inappropriate / 18+ content).
+     The NSFW art styles ("NSFW - Realistic", "NSFW - Anime", and the
+     "(Stronger)" variants with ``(((nsfw)))`` weighting) are prompt
+     templates that do the same thing by content.
+
+``generate(uncensored=True)`` applies exactly that: subChannel="nsfw"
+plus the documented prompt handling, nothing invented.
+
+CAVEAT (unverified pairing): the reference client sends subChannel="nsfw"
+paired with channel="b7kc35yv7u" (a different Perchance generator page).
+This client keeps channel="ai-text-to-image-generator" and only flips
+subChannel. If live uncensored generation is refused (invalid_data) or
+comes back filtered, the first thing to try is channel="b7kc35yv7u" for
+uncensored requests — that page also shows an "I am over 18 - Show
+Content" gate to new browser sessions, which the mint flow would then
+need to click.
 """
 
 import json
@@ -56,32 +108,98 @@ BASE = "https://image-generation.perchance.org/api"
 GENERATOR_PAGE = "https://perchance.org/ai-text-to-image-generator"
 
 # A current desktop Chrome UA — the backend expects a browser-like client.
+# Linux UA on purpose: the binary runs on Linux, so navigator.platform
+# agrees with the UA (a Windows UA on a Linux binary is itself a tell).
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+
+# Realistic desktop viewport. 800x600 (the old value) is a classic
+# headless tell; 1366x768 is the most common desktop size in real traffic.
+VIEWPORT = {"width": 1366, "height": 768}
 
 # Lean Chromium flags: no sandbox (containers), no /dev/shm (small hosts),
 # no GPU, no background services. Full Chromium binary, NOT headless shell
 # (Turnstile blocks the shell build).
-CHROMIUM_ARGS = [
+_BASE_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
-    "--disable-extensions",
     "--disable-background-networking",
     "--disable-sync",
     "--disable-translate",
     "--mute-audio",
     "--no-first-run",
     "--disable-features=site-per-process",
-    # 512 MB hosts (Render free): one process + no zygote keeps Chromium's
-    # RSS down so the mint survives instead of OOM-killed mid-Turnstile.
-    "--single-process",
+    # NOTE: --single-process was here for 512 MB hosts (one process keeps
+    # RSS down), but it was REMOVED 2026-11-06: it crashes the FULL Chrome
+    # binary at startup ("Cannot use V8 Proxy resolver in single process
+    # mode", browser dies before new_page — verified locally: launch with
+    # it fails, without it the browser stays alive). It only ever worked
+    # with the headless shell, which Turnstile blocks anyway. Multi-process
+    # full Chrome for a single mint page runs ~250-400 MB — the range the
+    # module docstring already documents. --no-zygote is kept: stable in
+    # containers and saves a little RAM.
     "--no-zygote",
     "--disable-software-rasterizer",
 ]
 
+# Patchright path: Patchright already removes --enable-automation and adds
+# --disable-blink-features=AutomationControlled itself. Do NOT re-add
+# --disable-extensions here — Patchright deliberately removes it (a
+# browser with extensions disabled is a detection signal).
+PATCHRIGHT_ARGS = _BASE_ARGS + ["--disable-blink-features=AutomationControlled"]
+
+# Plain-Playwright fallback path (only used if Patchright is not
+# installed): same lean flags, plus the AutomationControlled blink
+# feature; --disable-extensions kept here for RAM (plain Playwright is
+# detectable anyway, so the flag costs nothing extra there).
+PLAYWRIGHT_ARGS = _BASE_ARGS + [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-extensions",
+]
+
 _KEY_RE = re.compile(r'"userKey"\s*:\s*"([0-9a-fA-F]{64})"')
 _KEY_IN_URL_RE = re.compile(r"userKey=([0-9a-fA-F]{64})")
+
+
+def _load_browser_engine():
+    """Return (sync_playwright, engine_name, launch_args).
+
+    Patchright first (stealth-patched Chromium — the only engine with a
+    real chance against Turnstile on a datacentre IP). Falls back to
+    plain Playwright if Patchright is not installed, so local dev
+    without patchright still works.
+    """
+    try:
+        from patchright.sync_api import sync_playwright
+        return sync_playwright, "patchright", PATCHRIGHT_ARGS
+    except ImportError:
+        pass
+    try:
+        from playwright.sync_api import sync_playwright
+        return sync_playwright, "playwright", PLAYWRIGHT_ARGS
+    except ImportError:
+        return None, "none", []
+
+
+def _humanize(page):
+    """Move the mouse and scroll the way a real visitor does, with
+    random pauses. Turnstile's managed challenge watches behaviour as
+    well as fingerprints; a browser that never moves the mouse is an
+    obvious bot. Kept short (a few seconds) so the mint stays fast."""
+    w, h = VIEWPORT["width"], VIEWPORT["height"]
+    try:
+        # A few smooth mouse moves across the page.
+        for _ in range(3):
+            x = random.randint(80, w - 80)
+            y = random.randint(80, h - 80)
+            page.mouse.move(x, y, steps=random.randint(8, 20))
+            page.wait_for_timeout(random.randint(400, 1200))
+        # A small scroll, like someone glancing at the page.
+        page.mouse.wheel(0, random.randint(120, 400))
+        page.wait_for_timeout(random.randint(600, 1500))
+    except Exception:
+        pass  # mouse/scroll failing must never kill the mint
 
 
 class InvalidKeyError(RuntimeError):
@@ -211,14 +329,14 @@ class KeyManager:
 
     # -- browser minting -------------------------------------------------
     def _mint_via_browser(self, timeout=120):
-        """Open the generator page in headless Chromium and capture the
+        """Open the generator page in a stealth browser and capture the
         userKey from the /api/verifyUser call. Returns the key or None."""
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            self._last_error = "Playwright not installed on this host"
+        sync_playwright, engine_name, launch_args = _load_browser_engine()
+        if sync_playwright is None:
+            self._last_error = ("No stealth browser installed on this host "
+                                "(patchright missing; playwright also missing)")
             logger.warning("Perchance key mint: %s", self._last_error)
-            return None  # Playwright not installed — env key is the only way.
+            return None
 
         found = []
 
@@ -233,13 +351,41 @@ class KeyManager:
                 if m:
                     found.append(m.group(1))
 
+        def _try_verify_fetch(page):
+            """Ask for a key directly inside the page context — Turnstile
+            cookies are already set by now. Returns True if a key landed."""
+            try:
+                data = page.evaluate(
+                    """async () => {
+                        const r = await fetch(
+                          'https://image-generation.perchance.org/api/verifyUser?thread=0',
+                          {credentials: 'include'});
+                        return await r.text();
+                    }""")
+                before = len(found)
+                _capture(data)
+                return len(found) > before
+            except Exception:
+                return False
+
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+                # CRITICAL: channel="chromium" forces the FULL Chrome
+                # binary. Without it, Playwright/Patchright 1.49+ default
+                # to the lightweight chromium-headless-shell in headless
+                # mode — and Turnstile blocks the shell build outright.
+                # (Verified: plain launch looked for
+                # chromium_headless_shell-1248; channel="chromium" selects
+                # the full Chrome-for-Testing binary in new headless mode.)
+                browser = p.chromium.launch(headless=True, args=launch_args,
+                                            channel="chromium")
                 try:
                     ctx = browser.new_context(
                         user_agent=UA,
-                        viewport={"width": 800, "height": 600},
+                        viewport=VIEWPORT,
+                        locale="en-US",
+                        # Render's default region is Oregon, US West.
+                        timezone_id="America/Los_Angeles",
                     )
                     page = ctx.new_page()
                     # Capture the key from any verifyUser request/response.
@@ -249,33 +395,30 @@ class KeyManager:
                             if "verifyUser" in resp.url else None)
                     page.goto(GENERATOR_PAGE, wait_until="domcontentloaded",
                               timeout=timeout * 1000)
-                    # Let Cloudflare Turnstile run and the page settle.
+                    # Behave like a visitor: move the mouse, scroll, let
+                    # Turnstile's managed challenge observe real behaviour.
+                    _humanize(page)
                     try:
                         page.wait_for_load_state("networkidle", timeout=30000)
                     except Exception:
                         pass
-                    page.wait_for_timeout(6000)
-                    if not found:
-                        # Ask for a key directly inside the page context —
-                        # Turnstile cookies are already set by now.
-                        try:
-                            data = page.evaluate(
-                                """async () => {
-                                    const r = await fetch(
-                                      'https://image-generation.perchance.org/api/verifyUser?thread=0',
-                                      {credentials: 'include'});
-                                    return await r.text();
-                                }""")
-                            _capture(data)
-                        except Exception:
-                            pass
+                    # Turnstile can take a few seconds to complete; retry
+                    # the verifyUser fetch a few times with random waits
+                    # instead of giving up after one try.
+                    for _ in range(3):
+                        if found:
+                            break
+                        page.wait_for_timeout(random.randint(3000, 6000))
+                        _humanize(page)
+                        if _try_verify_fetch(page):
+                            break
                     ctx.close()
                 finally:
                     browser.close()
         except Exception as e:  # noqa: BLE001 - log the real reason; the
             # old code swallowed this silently, so Render logs showed nothing
             # and /health only said key_cached:false.
-            self._last_error = (f"browser mint failed: "
+            self._last_error = (f"browser mint failed [{engine_name}]: "
                                 f"{type(e).__name__}: {e}")
             logger.warning("Perchance key mint failed: %s",
                            self._last_error, exc_info=True)
@@ -292,6 +435,32 @@ def _safe_text(resp):
         return resp.text()
     except Exception:
         return ""
+
+
+# -- uncensored (adult) prompt handling --------------------------------
+# Verbatim from webgenimg's compose_prompt (adrianx26/webgenimg): the
+# documented adult-mode transform. Applied by generate() when
+# uncensored=True, BEFORE the request is sent (and before any retry, so
+# both attempts use the composed prompt).
+_ANTI_NSFW_RE = re.compile(r"\b(nsfw|nudity|inappropriate|18\+ content)\b",
+                           re.I)
+
+
+def _apply_adult_mode(prompt, negative):
+    """Adult-mode prompt composition (documented, not invented).
+
+    If "nsfw" is not already in the prompt, append
+    ``", (nsfw:1.2), mature, highly detailed"``; if "nsfw" is in the
+    negative prompt, strip the anti-NSFW terms from it. Returns
+    ``(prompt, negative)`` with stray double commas cleaned up.
+    """
+    if "nsfw" not in prompt.lower():
+        prompt = f"{prompt}, (nsfw:1.2), mature, highly detailed"
+    if "nsfw" in negative.lower():
+        negative = _ANTI_NSFW_RE.sub("", negative)
+    prompt = re.sub(r",\s*,+", ",", prompt).strip(", ")
+    negative = re.sub(r",\s*,+", ",", negative).strip(", ")
+    return prompt, negative
 
 
 class PerchanceClient:
@@ -330,12 +499,21 @@ class PerchanceClient:
 
     # -- public ----------------------------------------------------------
     def generate(self, prompt, negative_prompt="", seed=-1,
-                 resolution="768x768", guidance_scale=7):
+                 resolution="768x768", guidance_scale=7, uncensored=False):
         """Generate one image. Returns dict with id/bytes/seed/width/height.
 
         On ``invalid_key`` the key is refreshed once in-browser and the
         request is retried automatically.
+
+        ``uncensored=True`` selects Perchance's uncensored (adult) path
+        exactly as the reverse-engineered b7kc35yv7u client documents it:
+        subChannel="nsfw" in the generate call plus the adult prompt
+        composition (see _apply_adult_mode). There is no separate model
+        parameter — this is the mechanism the site itself uses.
         """
+        if uncensored:
+            prompt, negative_prompt = _apply_adult_mode(prompt,
+                                                        negative_prompt)
         with self._gen_lock:
             key = self.keys.get_key()
             if not key:
@@ -347,7 +525,8 @@ class PerchanceClient:
                     "so the server can mint one itself.")
             try:
                 return self._generate_once(prompt, negative_prompt, seed,
-                                           resolution, guidance_scale, key)
+                                           resolution, guidance_scale, key,
+                                           uncensored=uncensored)
             except InvalidKeyError:
                 # Key died mid-flight — mint a fresh one and retry once.
                 self.keys.invalidate()
@@ -359,11 +538,12 @@ class PerchanceClient:
                         "manually (copy it from a desktop browser on this "
                         "machine) and retry.")
                 return self._generate_once(prompt, negative_prompt, seed,
-                                           resolution, guidance_scale, new_key)
+                                           resolution, guidance_scale, new_key,
+                                           uncensored=uncensored)
 
     # -- internals -------------------------------------------------------
     def _generate_once(self, prompt, negative_prompt, seed, resolution,
-                       guidance_scale, key):
+                       guidance_scale, key, uncensored=False):
         rid = str(random.random())
         params = {
             "userKey": key,
@@ -378,7 +558,11 @@ class PerchanceClient:
             "resolution": resolution,
             "guidanceScale": guidance_scale,
             "channel": "ai-text-to-image-generator",
-            "subChannel": "public",
+            # The uncensored switch: "nsfw" instead of "public".
+            # Documented in webgenimg's client; see module docstring for
+            # the channel-pairing caveat (reference pairs it with
+            # channel="b7kc35yv7u").
+            "subChannel": "nsfw" if uncensored else "public",
             "userKey": key,
             "adAccessCode": "",
             "requestId": rid,

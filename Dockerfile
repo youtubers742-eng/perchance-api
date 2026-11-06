@@ -1,10 +1,11 @@
 # Perchance Image API — generic Docker image (host-agnostic).
 # Works on any host that runs containers: Render (Docker path), Railway,
-# Fly.io, Hugging Face Spaces (Docker), a VPS, etc. The primary deploy is
-# Render's native Python environment via render.yaml — this Dockerfile is
-# the fallback for Docker-based hosts.
+# Fly.io, Hugging Face Spaces (Docker), a VPS, etc. This Dockerfile is the
+# PRIMARY deploy path on Render (render.yaml uses env: docker) — the native
+# Python environment cannot run `patchright install --with-deps` because it
+# needs root for system packages.
 #
-# The Playwright Chromium install makes this image large (~700MB) — it is
+# The Patchright Chromium install makes this image large (~700MB) — it is
 # needed ONLY for the automatic userKey refresh (Cloudflare Turnstile).
 # If your host cannot run Chromium, set PERCHANCE_USER_KEY instead and
 # the server runs without ever launching a browser.
@@ -24,7 +25,7 @@ RUN apt-get update \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && playwright install chromium --with-deps
+    && patchright install chromium --with-deps
 
 COPY . .
 

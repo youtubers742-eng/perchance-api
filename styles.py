@@ -98,6 +98,102 @@ for _k in list(STYLES):
         STYLES[_UNICODE_ICON_KEY] = STYLES.pop(_k)
 
 
+# --------------------------------------------------------------------------
+# NSFW (+18) styles — the "uncensored" styles.
+#
+# These are NOT part of the 75 main-generator styles above. They come from
+# the reverse-engineered b7kc35yv7u generator's extracted_styles.json
+# (adrianx26/webgenimg), transcribed verbatim — including their negative
+# templates, which the 75 styles above do not have. That is why they live
+# in a separate dict of (prompt_template, negative_template) pairs and are
+# applied by apply_style_full() below; their prompt halves are also merged
+# into STYLES so GET /styles lists them and apply_style() works for them.
+#
+# The 5th NSFW style in that source, "NSFW Painted Anime", has EMPTY prompt
+# and negative templates there, so it is not included — there is nothing to
+# transcribe. The uncensored switch (subChannel="nsfw" + adult prompt
+# handling in client.py) works with or without an NSFW style picked.
+# --------------------------------------------------------------------------
+NSFW_STYLES = {
+    "NSFW - Realistic": (
+        "[input.description], highly realistic, realistic portrait, (nsfw), "
+        "anatomically correct, realistic photograph, real colors, award "
+        "winning photo, detailed face, realistic eyes, beautiful, sharp "
+        "focus, high resolution, volumetric lighting, incredibly detailed, "
+        "masterpiece, breathtaking, exquisite, great attention to skin and eyes",
+        "[input.negative], unrealistic, animated, 3d, sketches, (text), "
+        "low-quality, deformed, extra limbs, blurry, bad art, (logo), "
+        "watermark, blurred, cut off, extra fingers, bad quality, "
+        "distortion of proportions, deformed fingers, elongated body, "
+        "cropped image, deformed hands, deformed legs, deformed face, "
+        "twisted fingers, double image, long neck, extra limb, plastic, "
+        "disfigured, mutation, sloppy, ugly, pixelated, bad hands, "
+        "aliasing, overexposed, oversaturated, burnt image, fuzzy, poor "
+        "quality, deformed arms",
+    ),
+    "NSFW - Anime": (
+        "[input.description], intricate detail, hyper-anime, trending on "
+        "artstation, 8k, fluid motion, stunning shading, anime, highly "
+        "detailed, realistic, (nsfw), dramatic lighting, beautiful, "
+        "animation, sharp focus, award winning, masterpiece, cinematic, "
+        "dynamic, cinematic lighting, breathtaking, exquisite, great "
+        "attention to skin and eyes, exceptional, exemplary, unsurpassed, "
+        "viral, popular, buzzworthy, up-and-coming, emerging, promising, "
+        "acclaimed, premium",
+        "[input.negative], photography, low-quality, deformed, (text), "
+        "blurry, bad art, (logo), watermark, blurred, cut off, extra "
+        "fingers, bad quality, distortion of proportions, deformed "
+        "fingers, elongated body, cropped image, deformed hands, deformed "
+        "legs, deformed face, twisted fingers, double image, long neck, "
+        "extra limb, plastic, disfigured, mutation, sloppy, ugly, "
+        "pixelated, bad hands, aliasing, overexposed, oversaturated, "
+        "burnt image, fuzzy, poor quality, extra limbs, deformed arms",
+    ),
+    "NSFW - Realistic (Stronger)": (
+        "[input.description], highly realistic, realistic portrait, "
+        "(((nsfw))), anatomically correct, realistic photograph, real "
+        "colors, award winning photo, detailed face, realistic eyes, "
+        "beautiful, sharp focus, high resolution, volumetric lighting, "
+        "incredibly detailed, masterpiece, breathtaking, exquisite, great "
+        "attention to skin and eyes",
+        "[input.negative], unrealistic, animated, sketches, (text), "
+        "low-quality, deformed, extra limbs, blurry, bad art, (logo), "
+        "watermark, blurred, cut off, extra fingers, bad quality, "
+        "distortion of proportions, deformed fingers, elongated body, "
+        "cropped image, deformed hands, deformed legs, deformed face, "
+        "twisted fingers, double image, long neck, extra limb, plastic, "
+        "disfigured, mutation, sloppy, ugly, pixelated, bad hands, "
+        "aliasing, overexposed, oversaturated, burnt image, fuzzy, poor "
+        "quality, deformed arms",
+    ),
+    "NSFW - Anime (Stronger)": (
+        "[input.description], intricate detail, hyper-anime, trending on "
+        "artstation, 8k, fluid motion, stunning shading, anime, highly "
+        "detailed, realistic, (((nsfw))), dramatic lighting, beautiful, "
+        "animation, sharp focus, award winning, masterpiece, cinematic, "
+        "dynamic, cinematic lighting, breathtaking, exquisite, great "
+        "attention to skin and eyes, exceptional, exemplary, unsurpassed, "
+        "viral, popular, buzzworthy, up-and-coming, emerging, promising, "
+        "acclaimed, premium",
+        "[input.negative], photography, low-quality, deformed, (text), "
+        "blurry, bad art, (logo), watermark, blurred, cut off, extra "
+        "fingers, bad quality, distortion of proportions, deformed "
+        "fingers, elongated body, cropped image, deformed hands, deformed "
+        "legs, deformed face, twisted fingers, double image, long neck, "
+        "extra limb, plastic, disfigured, mutation, sloppy, ugly, "
+        "pixelated, bad hands, aliasing, overexposed, oversaturated, "
+        "burnt image, fuzzy, poor quality, extra limbs, deformed arms, "
+        "Mosaic",
+    ),
+}
+
+# Prompt halves of the NSFW styles, so they behave like any other style
+# for GET /styles and apply_style(); the negative halves are applied by
+# apply_style_full() only.
+for _name, (_p, _n) in NSFW_STYLES.items():
+    STYLES[_name] = _p.replace("[input.description]", "{prompt}")
+
+
 def list_styles():
     """Return the style names in a stable order."""
     return sorted(STYLES.keys())
@@ -120,3 +216,19 @@ def apply_style(style, prompt):
     # [input.xxx ...] fragments -> removed
     out = re.sub(r"\[[^\]]*\]", "", out)
     return re.sub(r"\s+", " ", out).strip()
+
+
+def apply_style_full(style, prompt, negative=""):
+    """Bake a style into BOTH the prompt and the negative prompt.
+
+    Returns ``(prompt, negative)``. Only the NSFW styles carry a negative
+    template (see NSFW_STYLES); for every other style the negative passes
+    through unchanged and this is identical to apply_style().
+    """
+    prompt_out = apply_style(style, prompt)
+    neg_tpl = NSFW_STYLES.get(style, (None, None))[1]
+    if not neg_tpl:
+        return prompt_out, negative
+    neg = neg_tpl.replace("[input.negative]", negative)
+    neg = re.sub(r",\s*,+", ",", neg).strip(", ")
+    return prompt_out, re.sub(r"\s+", " ", neg).strip()

@@ -4,19 +4,23 @@
 # outbound bandwidth. The service spins down after 15 min idle (~1 min
 # cold start on the next request).
 #
-# Build installs the Python deps AND Playwright Chromium (needed for the
-# automatic userKey refresh). Chromium is only launched on demand for a
-# few seconds per refresh and always closed afterwards, so the steady
-# state stays small — but if key refresh ever OOMs on 512 MB, set
-# PERCHANCE_USER_KEY by hand (copy it from a desktop browser on the
-# same machine) and the server never launches a browser.
+# Deploys as a DOCKER service (env: docker) — NOT the native Python env.
+# Two reasons, both learned the hard way:
+#   1. plan: free must be declared, or Render's Blueprint defaults the
+#      service to a paid plan and asks for payment info.
+#   2. `patchright install chromium --with-deps` needs root for system
+#      packages; the native Python build runs as a non-root user and fails
+#      with "su: Authentication failure". Inside Docker the install runs
+#      as root and works.
+# The Dockerfile installs Patchright Chromium (stealth browser for the
+# automatic userKey refresh) and runs uvicorn on $PORT.
 # ---------------------------------------------------------------------------
 services:
   - type: web
     name: perchance-api
-    env: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
-    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: PERCHANCE_USER_KEY
         value: ""

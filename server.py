@@ -5,14 +5,20 @@ Any AI agent, website, or Open WebUI instance can point at this server the
 same way it points at OpenAI's image API:
 
   POST /v1/images/generations   (OpenAI shape, returns b64_json images)
-  GET  /v1/models               (lists the "perchance-image" model)
-  GET  /styles                  (75 art styles)
+  GET  /v1/models               (lists "perchance-image" and
+                                 "perchance-image-uncensored")
+  GET  /styles                  (75 art styles + 4 NSFW styles)
   GET  /health                  (status + key state)
   GET  /                        (browser demo page)
 
+Uncensored (18+): POST /v1/images/generations with
+``"uncensored": true`` (or model "perchance-image-uncensored") sends
+subChannel="nsfw" plus the documented adult prompt handling — see
+client.py. Picking one of the 4 NSFW styles also turns it on.
+
 Open WebUI setup: Admin → Settings → Images → Engine "Default (Open AI)",
 API Base URL = https://<your-host>/v1, API Key = anything (e.g. "not-needed"),
-Model = perchance-image.
+Model = perchance-image (or perchance-image-uncensored for the adult path).
 
 Run:  uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
 """
@@ -28,11 +34,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from client import InvalidKeyError, KeyManager, PerchanceClient, PerchanceError
-from styles import STYLES, apply_style, list_styles
+from styles import NSFW_STYLES, STYLES, apply_style_full, list_styles
 
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "perchance-image"
+MODEL_ID_UNCENSORED = "perchance-image-uncensored"
 MAX_IMAGES_PER_REQUEST = 4          # OpenAI 'n' is clamped to 1..4
 MAX_RESOLUTION_SIDE = 768           # Perchance backend cap
 
@@ -90,6 +97,10 @@ class ImageRequest(BaseModel):
     style: str = ""
     seed: int = -1
     guidance_scale: float = 7.0
+    # Uncensored (18+) switch: subChannel="nsfw" + adult prompt handling
+    # in the Perchance call. Also enabled by model
+    # "perchance-image-uncensored" or by picking an NSFW style.
+    uncensored: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -108,8 +119,16 @@ def create_images(req: ImageRequest):
             detail=f"unknown style {style!r}; see GET /styles "
                    f"({len(STYLES)} available)")
 
-    full_prompt = apply_style(style, prompt) if style else prompt
     negative = _extra(req, "negative_prompt", "negativePrompt", default="") or ""
+    # Uncensored on if: explicit flag, the -uncensored model id, or an
+    # NSFW style was picked (a user choosing "NSFW - Realistic" plainly
+    # wants the NSFW channel, not "public").
+    uncensored = (
+        bool(_extra(req, "uncensored", default=False))
+        or req.model == MODEL_ID_UNCENSORED
+        or style in NSFW_STYLES
+    )
+    full_prompt, negative = apply_style_full(style, prompt, negative)
     seed = _extra(req, "seed", default=-1)
     guidance = _extra(req, "guidance_scale", "guidanceScale", default=7.0)
     try:
@@ -128,6 +147,7 @@ def create_images(req: ImageRequest):
                 seed=int(seed) if seed is not None else -1,
                 resolution=resolution,
                 guidance_scale=guidance,
+                uncensored=uncensored,
             )
             data.append({
                 "b64_json": base64.b64encode(result["bytes"]).decode(),
@@ -152,12 +172,20 @@ def create_images(req: ImageRequest):
 def list_models():
     return {
         "object": "list",
-        "data": [{
-            "id": MODEL_ID,
-            "object": "model",
-            "created": 0,
-            "owned_by": "perchance",
-        }],
+        "data": [
+            {
+                "id": MODEL_ID,
+                "object": "model",
+                "created": 0,
+                "owned_by": "perchance",
+            },
+            {
+                "id": MODEL_ID_UNCENSORED,
+                "object": "model",
+                "created": 0,
+                "owned_by": "perchance",
+            },
+        ],
     }
 
 
@@ -166,8 +194,9 @@ def list_models():
 # --------------------------------------------------------------------------
 @app.get("/styles")
 def get_styles():
-    """All 75 art styles. Pass one as `style` in the generation request
-    (or as extra_body.style from an OpenAI client)."""
+    """All 75 art styles + 4 NSFW styles. Pass one as `style` in the
+    generation request (or as extra_body.style from an OpenAI client).
+    Picking an NSFW style also turns on the uncensored path."""
     return {"count": len(STYLES), "styles": list_styles()}
 
 
@@ -177,6 +206,7 @@ def health():
     return {
         "ok": True,
         "model": MODEL_ID,
+        "uncensored_model": MODEL_ID_UNCENSORED,
         "styles": len(STYLES),
         "key_cached": bool(km.key),
         "key_source": km.source,  # env | file | browser | none
@@ -206,7 +236,7 @@ img{{max-width:100%;margin-top:12px;border-radius:8px}}
 small{{color:#666}}
 </style></head><body>
 <h1>🎨 Perchance Image API</h1>
-<p><small>Free image generation · OpenAI-compatible · model <b>perchance-image</b></small></p>
+<p><small>Free image generation · OpenAI-compatible · model <b>perchance-image</b> (or <b>perchance-image-uncensored</b>, 18+)</small></p>
 <input id="prompt" placeholder="Describe your image… e.g. a steampunk woman">
 <select id="style"><option value="">No style</option>{options}</select>
 <select id="size">
@@ -214,6 +244,7 @@ small{{color:#666}}
   <option value="1024x768">Landscape</option>
   <option value="768x1024">Portrait</option>
 </select>
+<label style="display:block;margin:6px 0"><input type="checkbox" id="uncensored" style="width:auto"> 🔞 Uncensored (18+) — NSFW channel, no safety filter</label>
 <button id="go" onclick="gen()">Generate (10–20s)</button>
 <p id="status"></p>
 <div id="out"></div>
@@ -227,7 +258,8 @@ async function gen(){{
       method:'POST', headers:{{'Content-Type':'application/json'}},
       body:JSON.stringify({{
         prompt:document.getElementById('prompt').value,
-        model:'perchance-image',
+        model:document.getElementById('uncensored').checked?'perchance-image-uncensored':'perchance-image',
+        uncensored:document.getElementById('uncensored').checked,
         size:document.getElementById('size').value,
         style:document.getElementById('style').value,
         n:1

@@ -1,4 +1,8 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 httpx>=0.27
-playwright>=1.44
+# Patchright — stealth-patched Playwright drop-in (same API). Used ONLY for
+# the automatic userKey mint: plain Playwright Chromium is fingerprinted
+# and blocked by Cloudflare Turnstile on datacentre IPs. Install the
+# browser with: patchright install chromium --with-deps
+patchright>=1.64
