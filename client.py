@@ -88,6 +88,16 @@ box on the page. _fill_prompt now scans perchance.org frames for
 ``textarea.paragraph-input[data-name="description"]`` then
 ``textarea[data-name="description"]``.
 
+KEY-CAPTURE WIDENING (2026-11-06) — the fill fix worked (live Colab
+trail: prompt filled, Generate clicked, cf_clearance present) yet still
+no key: NO request URL carried "userKey=" in 30s. Two hypotheses:
+(A) the key travels in a POST body (JSON/form) or a response body, not
+the URL; (B) the page calls a different endpoint, or fires nothing at
+all. The listener now captures from request URLs, POST bodies, and
+/api/* response bodies, and logs every /api/* call (method + path +
+key?) in the step trail, so the next live run says definitively
+whether generate fired and where the key lives.
+
 RAM note: full Chromium (required — Turnstile blocks Playwright's headless
 shell) needs roughly 250-400 MB while it runs. The browser is only launched
 on demand (LAZY — never at startup; the 2026-11-06 startup warm-up mint
@@ -137,6 +147,7 @@ import random
 import re
 import threading
 import time
+from urllib.parse import urlparse
 
 import httpx
 
@@ -214,6 +225,16 @@ PLAYWRIGHT_ARGS = _BASE_ARGS + [
 
 _KEY_RE = re.compile(r'"userKey"\s*:\s*"([0-9a-fA-F]{64})"')
 _KEY_IN_URL_RE = re.compile(r"userKey=([0-9a-fA-F]{64})")
+# Same key in any other encoding (form-data name=, "userKey": with
+# different quoting, ...): the literal label, a short run of non-hex
+# separators, then the 64 hex chars. Catches encodings the two patterns
+# above miss without matching bare hashes (the label must be present).
+_KEY_ANY_RE = re.compile(r'userKey[^0-9a-fA-F]{1,12}([0-9a-fA-F]{64})')
+
+# Host whose /api/* calls the mint logs in the step trail. Overridden
+# in tests to point at a localhost mock (the mock's /api/* calls must
+# be logged the same way the real ones are).
+_API_HOST = "perchance.org"
 
 
 def _load_browser_engine():
@@ -438,7 +459,8 @@ class KeyManager:
             trail = "; ".join(s.split(" ", 1)[1] for s in self._mint_steps
                               if s.split(" ", 1)[1].startswith(
                                   ("widget:", "gate:", "generate:",
-                                   "verifyUser:", "cookies:", "prompt:")))
+                                   "verifyUser:", "cookies:", "prompt:",
+                                   "api:", "key:")))
             detail = f" [{trail}]" if trail else ""
             self._last_error = ("browser mint returned no key "
                                 "(Turnstile blocked or page never yielded "
@@ -697,15 +719,17 @@ class KeyManager:
         B. FILL A DUMMY PROMPT ("a red rose") in the generator's prompt
            box, THEN click the Generate button in the generator iframe.
            This is the step the old mint was missing twice over: the
-           page only calls /api/verifyUser and /api/generate (whose
-           request URL carries userKey=...) after a real Generate click
-           — and it validates the prompt first, so a Generate click
-           with an EMPTY prompt fires nothing at all (the live Colab
-           mint: Turnstile passed, Generate clicked, 30s of silence).
-           The key is captured from ANY request URL carrying
-           userKey=... (generate URLs included), and the widget is
-           re-checked during the wait — the challenge can also appear
-           only after Generate is clicked.
+           page only calls /api/verifyUser and /api/generate after a
+           real Generate click — and it validates the prompt first, so
+           a Generate click with an EMPTY prompt fires nothing at all
+           (the live Colab mint: Turnstile passed, Generate clicked,
+           30s of silence). The key is captured from ANY request URL
+           carrying userKey=..., from POST bodies (JSON/form), and
+           from /api/* response bodies — the live Colab mint proved
+           the URL alone is not where the key lives — and every /api/*
+           call is logged, so the trail shows whether generate fired
+           at all. The widget is re-checked during the wait — the
+           challenge can also appear only after Generate is clicked.
         C. If still no key, verifyUser three different ways: in-page
            fetch (exact error recorded), context API request (same
            cookies, no CORS), navigate to the verifyUser URL (the
@@ -730,19 +754,96 @@ class KeyManager:
             logger.warning("Perchance key mint: %s", self._last_error)
             return None
 
-        found = []
+        found = []          # captured keys, in order found
+        found_sources = []  # parallel: where each key was found
         verify_statuses = []
+        # Every /api/* call the page makes, keyed by (method, path):
+        # {"req": n, "key_req": bool, "key_resp": bool, "status": last,
+        #  "key_source": str}. First occurrences (and a summary) go to
+        # the step trail, so the next live run says definitively
+        # whether /api/generate fired at all and where the key lived.
+        api_calls = {}
 
-        def _capture(text):
+        def _capture(text, source=""):
+            """Search text for a userKey (JSON field, query/form param,
+            or any other userKey=... encoding). Records the key and
+            where it was found. Returns the key or None."""
             if not text:
-                return
-            m = _KEY_RE.search(text)
-            if m:
-                found.append(m.group(1))
+                return None
+            m = (_KEY_RE.search(text) or _KEY_IN_URL_RE.search(text)
+                 or _KEY_ANY_RE.search(text))
+            if not m:
+                return None
+            found.append(m.group(1))
+            found_sources.append(source or "?")
+            return m.group(1)
+
+        def _api_path(url):
+            try:
+                return urlparse(url).path or "/"
+            except Exception:
+                return url
+
+        def _log_api_req(method, url, key_found, key_source=""):
+            path = _api_path(url)
+            entry = api_calls.get((method, path))
+            if entry is None:
+                api_calls[(method, path)] = {
+                    "req": 1, "key_req": key_found, "key_resp": False,
+                    "status": None, "key_source": key_source}
+                self._step(f"api: {method} {path} "
+                           f"(key: {'yes' if key_found else 'no'})")
             else:
-                m = _KEY_IN_URL_RE.search(text)
-                if m:
-                    found.append(m.group(1))
+                entry["req"] += 1
+                if key_found and not entry["key_req"]:
+                    entry["key_req"] = True
+                    entry["key_source"] = key_source
+
+        def _log_api_resp(method, url, status, key_found, key_source=""):
+            path = _api_path(url)
+            entry = api_calls.get((method, path))
+            if entry is None:
+                api_calls[(method, path)] = {
+                    "req": 0, "key_req": False, "key_resp": key_found,
+                    "status": status, "key_source": key_source}
+                if key_found:
+                    self._step(f"api: {method} {path} "
+                               "response carried key")
+            else:
+                entry["status"] = status
+                if key_found and not entry["key_resp"]:
+                    entry["key_resp"] = True
+                    if not entry["key_source"]:
+                        entry["key_source"] = key_source
+                    self._step(f"api: {method} {path} "
+                               "response carried key")
+
+        def _api_summary():
+            if not api_calls:
+                return "api: no /api/* calls seen"
+            parts = []
+            for (method, path), e in sorted(api_calls.items()):
+                s = f"{method} {path} x{e['req']}"
+                if e["key_req"]:
+                    s += " key:req"
+                if e["key_resp"]:
+                    s += " key:resp"
+                if e["status"] is not None:
+                    s += f" resp:{e['status']}"
+                if not e["key_req"] and not e["key_resp"]:
+                    s += " no-key"
+                parts.append(s)
+            return "api: " + " | ".join(parts)
+
+        _last_summary = [None]
+
+        def _log_api_summary():
+            """Log the /api/* summary, but only when it changed since
+            the last time (called after Phase B and at mint end)."""
+            s = _api_summary()
+            if s != _last_summary[0]:
+                _last_summary[0] = s
+                self._step(s)
 
         def _try_verify_fetch(page):
             """Ask for a key directly inside the page context — Turnstile
@@ -785,7 +886,7 @@ class KeyManager:
                 kind = "html/other"
             verify_statuses.append(f"{status} {kind}")
             before = len(found)
-            _capture(data)
+            _capture(data, "verifyUser fetch")
             return len(found) > before
 
         def _try_verify_api_request(ctx):
@@ -818,7 +919,7 @@ class KeyManager:
                     kind = "html/other"
                 verify_statuses.append(f"api-req {status} {kind}")
                 before = len(found)
-                _capture(body)
+                _capture(body, "verifyUser api-request")
                 return len(found) > before
             except Exception as e:
                 verify_statuses.append(
@@ -873,21 +974,54 @@ class KeyManager:
                     page = ctx.new_page()
 
                     def _on_request(req):
-                        # Capture from ANY request URL carrying userKey=...
-                        # — the key most reliably appears in the
-                        # /api/generate request URL after a Generate
-                        # click, not in verifyUser alone. The old
-                        # listener only watched verifyUser URLs and
-                        # missed that entirely.
-                        _capture(req.url)
+                        # Capture from ANY request carrying a userKey:
+                        # the URL (the old behaviour), AND the POST
+                        # body (JSON or form-encoded — the live Colab
+                        # mint clicked Generate and no request URL
+                        # carried userKey= in 30s, so the key may
+                        # travel in the body instead). Every /api/*
+                        # call is logged so the trail shows whether
+                        # generate fired at all.
+                        url = req.url or ""
+                        is_api = "/api/" in url and _API_HOST in url
+                        key_here = _capture(url, "request URL")
+                        body_key = None
+                        if req.method in ("POST", "PUT", "PATCH"):
+                            body_key = _capture(
+                                _request_body_text(req), "POST body")
+                        if is_api:
+                            _log_api_req(
+                                req.method, url,
+                                bool(key_here or body_key),
+                                "url" if key_here else
+                                ("body" if body_key else ""))
 
                     def _on_response(resp):
-                        if "verifyUser" in resp.url:
+                        url = resp.url or ""
+                        if "verifyUser" in url:
                             try:
                                 verify_statuses.append(str(resp.status))
                             except Exception:
                                 pass
-                            _capture(_safe_text(resp))
+                        if "/api/" not in url or _API_HOST not in url:
+                            return
+                        # The key may come back in a JSON response
+                        # body (a verifyUser/generate reply) rather
+                        # than in any request.
+                        body = _safe_api_text(resp)
+                        key_here = (_capture(body, "response body")
+                                    if body else None)
+                        try:
+                            method = resp.request.method
+                        except Exception:
+                            method = "?"
+                        try:
+                            status = resp.status
+                        except Exception:
+                            status = None
+                        _log_api_resp(method, url, status,
+                                      bool(key_here),
+                                      "response" if key_here else "")
 
                     page.on("request", _on_request)
                     page.on("response", _on_response)
@@ -948,10 +1082,13 @@ class KeyManager:
                     if self._mint_stop.is_set():
                         self._step("key: aborted (mint stopped)")
                     elif found:
-                        self._step("key: captured from page request URL")
+                        src = (found_sources[-1] if found_sources
+                               else "page request")
+                        self._step(f"key: captured from {src}")
                     else:
-                        self._step("key: not in page requests after "
-                                   "Generate click (30s)")
+                        self._step("key: not in page requests/bodies/"
+                                   "responses after Generate click (30s)")
+                    _log_api_summary()
 
                     # -- Phase C: verifyUser, three different ways ------
                     # The old Phase C retried the SAME in-page fetch x3,
@@ -996,6 +1133,8 @@ class KeyManager:
                 finally:
                     self._active_browser = None
                     browser.close()
+            # Final /api/* summary (deduped against the Phase B one).
+            _log_api_summary()
         except Exception as e:  # noqa: BLE001 - log the real reason; the
             # old code swallowed this silently, so Render logs showed nothing
             # and /health only said key_cached:false.
@@ -1018,6 +1157,56 @@ def _safe_text(resp):
         return resp.text()
     except Exception:
         return ""
+
+
+def _request_body_text(req):
+    """Best-effort request body as text (POST/PUT/PATCH). Playwright
+    exposes it as ``post_data`` (str) or ``post_data_buffer`` (bytes);
+    either can be absent. Never raises — a missing body just means
+    there is nothing to capture from."""
+    try:
+        data = req.post_data
+    except Exception:
+        data = None
+    if data:
+        return data
+    try:
+        buf = req.post_data_buffer
+    except Exception:
+        buf = None
+    if buf:
+        try:
+            return bytes(buf).decode("utf-8", "ignore")
+        except Exception:
+            return None
+    return None
+
+
+def _safe_api_text(resp):
+    """Best-effort body text for an /api/* response. Skips the image
+    download endpoint (binary, megabytes) and oversized or clearly
+    non-text bodies; never raises. The key may come back in a JSON
+    response body rather than in any request."""
+    try:
+        url = resp.url or ""
+    except Exception:
+        return ""
+    if "downloadTemporaryImage" in url:
+        return ""
+    try:
+        length = resp.headers.get("content-length")
+        if length is not None and int(length) > 1_000_000:
+            return ""
+    except Exception:
+        pass
+    try:
+        ctype = (resp.headers.get("content-type") or "").lower()
+    except Exception:
+        ctype = ""
+    if ctype and ("json" not in ctype and "text" not in ctype
+                 and "javascript" not in ctype):
+        return ""
+    return _safe_text(resp)
 
 
 # -- uncensored (adult) prompt handling --------------------------------
